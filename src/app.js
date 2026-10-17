@@ -68,7 +68,10 @@ const ICONS = {
   chat:'<path d="M4 5h16v11H9l-5 4z"/>',
   shuffle:'<path d="M3 6h3c3 0 5 12 9 12h6"/><path d="M18 15l3 3-3 3"/><path d="M3 18h3c1.5 0 2.7-1.7 3.7-4"/><path d="M14 8.3C14.9 6.8 16 6 18 6h3"/><path d="M18 3l3 3-3 3"/>',
   copy:'<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
-  search:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>'
+  search:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+  headphones:'<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/><path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>',
+  download:'<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>',
+  share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/>'
 };
 const ic = (n, cls = 'ico') => `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 
@@ -237,8 +240,14 @@ function undoRecord(item) { const M = S.mistakes.items; if (item.prev) M[item.ke
 /* ---------- Vocabulario (repetición espaciada tipo SM-2) ---------- */
 const cardKey = (deckId, w) => deckId + '|' + w;
 function myDeck() { return {id:'mine', level:'—', title:'Mis palabras', es:'Palabras que has añadido tú', words:S.vocab.mine.map(w => [w.w, w.p || '', w.d || '', w.es || '', w.ex || ''])}; }
-const allDecks = () => DECKS.concat(S.vocab.mine.length ? [myDeck()] : []);
-const deckById = id => id === 'mine' ? myDeck() : DECKS.find(d => d.id === id);
+function lessonDeck(id) {
+  const l = lessonById(id), A = AUDIO[id];
+  if (!l || !A || !(A.vocab || []).length) return null;
+  return {id:'L:' + id, level:l.level, title:'Lección: ' + l.title, es:'Vocabulario de la lección «' + l.es + '»', words:A.vocab.map(v => [v[0], '', v[4] || '', v[1], v[2]])};
+}
+const startedLessonDecks = () => Object.keys(AUDIO).map(lessonDeck).filter(d => d && d.words.some(w => card(cardKey(d.id, w[0]))));
+const allDecks = () => DECKS.concat(startedLessonDecks(), S.vocab.mine.length ? [myDeck()] : []);
+const deckById = id => id === 'mine' ? myDeck() : String(id).startsWith('L:') ? lessonDeck(id.slice(2)) : DECKS.find(d => d.id === id);
 const card = k => S.vocab.cards[k];
 function wordState(c) { if (!c) return 'new'; if (c.ivl >= 21) return 'mastered'; if (c.ivl >= 7) return 'learned'; return 'learning'; }
 function gradeCard(k, g) {
@@ -380,6 +389,597 @@ function speak(text) {
 }
 
 /* =========================================================
+   Clases en audio (ElevenLabs)
+   ========================================================= */
+const AUDIO = window.AUDIO || {};
+const EL_API = 'https://api.elevenlabs.io';
+const EL_KEY = 'rutaC2.eleven', AMETA_KEY = 'rutaC2.audioMeta', APOS_KEY = 'rutaC2.audioPos';
+const EL_MODELS = [
+  {id:'eleven_flash_v2_5', name:'Flash v2.5', note:'Económico: ½ crédito por carácter. Ideal para el plan gratuito.', factor:0.5, lang:true},
+  {id:'eleven_multilingual_v2', name:'Multilingual v2', note:'Máxima naturalidad: 1 crédito por carácter.', factor:1, lang:false}
+];
+const EL_VOICES = {
+  teacher:[
+    {id:'STFMZniNPVEtF1Ug6b81', name:'Miguel', d:'latino (venezolano), cálido y cercano · biblioteca'},
+    {id:'HS7W0ly7cmPolP5WMyz9', name:'Carlos Garza', d:'latino (mexicano neutro), cálido · biblioteca'},
+    {id:'3hn25giptIBsW5fakCzE', name:'Javier', d:'latino neutro, claro · biblioteca'},
+    {id:'y49lIAGrsmQl8dzq2W93', name:'Rayito', d:'latino (mexicano), sereno · biblioteca'}
+  ],
+  native:[
+    {id:'JBFqnCBsd6RMkjVDRZzb', name:'George', d:'británico, cálido · predeterminada'},
+    {id:'onwK4e9ZLuTAKqWW03F9', name:'Daniel', d:'británico, locutor · predeterminada'},
+    {id:'MMTfKxXgrCWYhXQllY7o', name:'James', d:'británico, examinador IELTS · biblioteca'},
+    {id:'lo1O1Dz1Tu4FWVEPaxuT', name:'Oliver', d:'británico, narrador pausado · biblioteca'}
+  ]
+};
+const AKINDS = {
+  theory:{label:'Clase de teoría', file:'Teoria', icon:'book'},
+  chunks:{label:'Refuerzo y frases nativas', file:'Refuerzo y frases nativas', icon:'chat'},
+  vocab:{label:'Vocabulario de la lección', file:'Vocabulario', icon:'cards'}
+};
+const DESIGN_DESC = 'A friendly Latino man in his forties from Miami, speaking Latin American Spanish with a soft Caribbean touch. Warm, cheerful, smiling voice. He speaks slowly and clearly, like an enthusiastic and patient teacher. Studio quality, close microphone.';
+const DESIGN_TEXT = '¡Hola! Bienvenido a tu clase de inglés. Hoy vamos a aprender, paso a paso y sin prisas, la diferencia entre el present simple y el present continuous. Relájate, escucha con atención y repite conmigo en voz alta. ¿Listo? ¡Vamos allá!';
+const TEST_SCRIPT = 'T: ¡Hola! Soy tu profesor de inglés. Ahora escucha a nuestro amigo británico.\nN: Hello! Lovely to meet you. Shall we get started?';
+const loadJSON = (k, d) => { try { return Object.assign(d, JSON.parse(localStorage.getItem(k) || '{}')); } catch (e) { return d; } };
+const saveJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+let EL = loadJSON(EL_KEY, {key:'', model:'eleven_flash_v2_5', teacher:'STFMZniNPVEtF1Ug6b81', native:'JBFqnCBsd6RMkjVDRZzb', mine:[], pause:1, music:true});
+let AMETA = loadJSON(AMETA_KEY, {});
+let APOS = loadJSON(APOS_KEY, {});
+const saveEL = () => saveJSON(EL_KEY, EL), saveAMeta = () => saveJSON(AMETA_KEY, AMETA);
+let ELSUB = null, genBusy = null;
+const GEN = {};
+const DESIGN = {busy:false, err:'', previews:[], desc:DESIGN_DESC, text:DESIGN_TEXT};
+const elModel = () => EL_MODELS.find(m => m.id === EL.model) || EL_MODELS[0];
+const voiceList = role => EL_VOICES[role].concat(EL.mine.filter(v => !EL_VOICES[role].some(x => x.id === v.id)));
+const voiceName = (role, id) => { const v = voiceList(role).find(x => x.id === id); return v ? v.name : 'voz personalizada'; };
+const aid = (lessonId, kind, sample) => lessonId + '|' + kind + (sample ? '|sample' : '');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const fmtN = n => Math.round(n).toLocaleString('es');
+const fmtDur = s => { s = Math.round(s); return Math.floor(s / 60) + ':' + pad(s % 60); };
+const fmtMB = b => (b / 1048576).toFixed(1).replace('.', ',') + ' MB';
+const canShareFiles = typeof navigator !== 'undefined' && typeof navigator.canShare === 'function';
+
+/* ---------- Almacén de audios (IndexedDB) ---------- */
+const IDB = (() => {
+  let p = null;
+  const open = () => p || (p = new Promise((res, rej) => {
+    if (!window.indexedDB) { rej(new Error('idb')); return; }
+    const r = indexedDB.open('rutaC2-audio', 1);
+    r.onupgradeneeded = () => { const db = r.result; for (const s of ['seg', 'audio']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => { p = null; rej(r.error); };
+  }));
+  const run = (store, mode, fn) => open().then(db => new Promise((res, rej) => {
+    const t = db.transaction(store, mode), req = fn(t.objectStore(store));
+    t.oncomplete = () => res(req && req.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error);
+  }));
+  return {
+    get:(s, k) => run(s, 'readonly', st => st.get(k)),
+    put:(s, k, v) => run(s, 'readwrite', st => st.put(v, k)),
+    has:(s, k) => run(s, 'readonly', st => st.count(k)).then(n => n > 0),
+    del:(s, keys) => run(s, 'readwrite', st => { for (const k of [].concat(keys)) st.delete(k); return null; })
+  };
+})();
+
+/* ---------- Guiones ----------
+   Líneas: ~ intro|outro|section|sub (música) · ## / ### títulos (los lee el profesor) · T: profesor
+   N: nativo · E: nativo + pausa para repetir · R: nativo despacio y normal + pausa · Q: pregunta | respuesta · P: segundos */
+const endDot = s => /[.!?…»]$/.test(s) ? s : s + '.';
+const capFirst = s => s.charAt(0).toUpperCase() + s.slice(1);
+const spoken = s => plain(s).replace(/\s+\/\s+/g, ', o ').trim();
+const QPRE = ['Di en inglés:', '¿Cómo dirías', 'Ahora:', 'Y esta:', 'Traduce:'];
+function chunksScript(l, A) {
+  const d = A.drills || [], c = A.chunks || [];
+  const out = ['~ intro', `T: ¡Hola! Bienvenido al audio de refuerzo y frases nativas de la lección «${l.es}».`];
+  if (d.length && c.length) out.push('T: Este audio tiene dos partes. Primero, ejemplos de refuerzo: te digo una frase en español, tú intentas decirla en inglés durante la pausa, y después escuchas al nativo y repites. Luego, frases nativas: expresiones que los británicos usan todos los días. ¡Empezamos!');
+  if (d.length) {
+    out.push(`## ${c.length ? 'Primera parte: e' : 'E'}jemplos de refuerzo`, 'T: Recuerda: piensa la frase en inglés durante la pausa y dila en voz alta antes de escuchar al nativo. Después, repite.');
+    d.forEach((x, i) => {
+      if (i && i % 5 === 0) out.push('~ sub');
+      const p = QPRE[i % QPRE.length];
+      out.push(`Q: ${p === '¿Cómo dirías' ? `¿Cómo dirías: «${x[0]}»?` : `${p} «${x[0]}»`} | ${x[1]}`);
+      if (x[2]) out.push('T: ' + endDot(x[2]));
+    });
+  }
+  if (c.length) {
+    out.push(`## ${d.length ? 'Segunda parte: f' : 'F'}rases nativas`, 'T: Ahora vamos con las frases nativas. Apréndelas como un bloque, tal cual, sin traducir palabra por palabra. Escucha, repite y fíjate en cuándo se usan.');
+    c.forEach((x, i) => {
+      if (i && i % 4 === 0) out.push('~ sub');
+      out.push('R: ' + x[0], `T: Significa: ${endDot(x[1])}${x[4] ? ' ' + endDot(x[4]) : ''}`, 'E: ' + x[2]);
+    });
+    out.push('## Repaso rápido', 'T: Último reto. Te digo la frase en español y tú la dices en inglés antes que el nativo.');
+    c.forEach(x => out.push(`Q: «${x[1]}» | ${x[0]}`));
+  }
+  out.push('T: ¡Muy bien! Escucha este audio varias veces durante la semana: cuantas más veces oigas estas frases, más natural te van a salir. ¡Nos escuchamos pronto!', '~ outro');
+  return out.join('\n');
+}
+function vocabScript(l, A) {
+  const v = A.vocab;
+  const out = ['~ intro', `T: ¡Hola! Bienvenido al audio de vocabulario de la lección «${l.es}». Hoy vas a aprender ${v.length} palabras y expresiones muy útiles${A.topic ? ' sobre ' + A.topic : ''}.`,
+    'T: Así funciona: escucharás cada palabra primero despacio y después a velocidad normal. Repítela en voz alta. Te digo qué significa y escuchas un ejemplo para repetir. Al final hacemos un repaso rápido. ¡Vamos!', '## Las palabras'];
+  v.forEach((x, i) => {
+    if (i && i % 5 === 0) out.push('~ sub');
+    out.push('R: ' + x[0], `T: Significa: ${endDot(x[1])}${x[4] ? ' ' + endDot(x[4]) : ''}`, 'E: ' + x[2]);
+  });
+  out.push('## Repaso rápido', 'T: Ahora te digo la palabra en español y tú la dices en inglés antes que el nativo.');
+  v.forEach(x => out.push(`Q: ${endDot(capFirst(x[1].split(';')[0].trim()))} | ${x[0]}`));
+  out.push('T: ¡Excelente! Escucha este audio un par de veces esta semana y verás cómo estas palabras empiezan a salirte solas. ¡Hasta la próxima!', '~ outro');
+  return out.join('\n');
+}
+function audioScript(l, kind) {
+  const A = l && AUDIO[l.id];
+  if (!A) return '';
+  if (kind === 'theory') return A.theory || '';
+  if (kind === 'chunks') return (A.drills || []).length || (A.chunks || []).length ? chunksScript(l, A) : '';
+  if (kind === 'vocab') return (A.vocab || []).length ? vocabScript(l, A) : '';
+  return '';
+}
+
+/* ---------- Plan de audio: fragmentos de voz, silencios y música ---------- */
+const SPEED = {T:0.94, N:0.95, slow:0.78};
+const CHIME_LEN = {intro:2.6, section:1.9, sub:1.1, outro:2.8};
+function planAudio(script) {
+  const f = EL.pause || 1, out = [];
+  const last = () => { for (let i = out.length - 1; i >= 0; i--) if (out[i].t !== 'sec') return out[i]; return null; };
+  const push = it => {
+    const p = last();
+    if (p && it.t === 'tts' && p.t === 'tts' && p.v === 'T' && it.v === 'T' && p.text.length + it.text.length < 900) { p.text += ' ' + it.text; return; }
+    if (p && it.t === 'chime') out.push({t:'sil', s:it.k === 'sub' ? 0.6 : 0.9});
+    else if (p && p.t === 'chime') out.push({t:'sil', s:0.5});
+    else if (p && p.t === 'tts' && it.t === 'tts') out.push({t:'sil', s:p.v === it.v ? 0.45 : 0.6});
+    out.push(it);
+  };
+  const T = text => { if (text) push({t:'tts', v:'T', text, speed:SPEED.T}); };
+  const N = (text, slow) => { if (text) push({t:'tts', v:'N', text, speed:slow ? SPEED.slow : SPEED.N}); };
+  const sil = s => push({t:'sil', s});
+  const music = (k, alt) => { if (EL.music) push({t:'chime', k}); else sil(alt); };
+  const rep = s => clamp(1.3 + s.length * 0.055, 2.3, 6) * f;
+  const think = s => clamp(2.3 + s.length * 0.04, 3.2, 5.5) * f;
+  for (const raw of String(script).split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('//')) continue;
+    let m;
+    if ((m = line.match(/^~\s*(intro|outro|section|sub)\s*$/))) { music(m[1], m[1] === 'sub' ? 0.8 : 1.4); continue; }
+    if (line.startsWith('## ')) { out.push({t:'sec'}); music('section', 1.4); T(endDot(spoken(line.slice(3)))); sil(0.5); continue; }
+    if (line.startsWith('### ')) { music('sub', 0.8); T(endDot(spoken(line.slice(4)))); continue; }
+    if ((m = line.match(/^P:\s*([\d.]+)/))) { sil(Number(m[1]) * f); continue; }
+    if (!(m = line.match(/^([TNERQ]):\s*(.+)$/))) continue;
+    const k = m[1], body = m[2].trim();
+    if (k === 'T') T(spoken(body));
+    else if (k === 'N') N(spoken(body));
+    else if (k === 'E') { N(spoken(body)); sil(rep(body)); }
+    else if (k === 'R') { const s = spoken(body); N(s, true); sil(0.8); N(s); sil(rep(body)); }
+    else if (k === 'Q') { const [q, a] = splitPipe(body); T(spoken(q)); sil(think(a || q)); if (a) { N(spoken(a)); sil(rep(a)); } }
+  }
+  return out;
+}
+/* Muestra: la introducción y el primer bloque (hasta el segundo título ##), como mucho un 30 % del audio */
+function samplePlan(plan) {
+  const secs = []; plan.forEach((x, i) => { if (x.t === 'sec') secs.push(i); });
+  let cut = secs.length >= 2 ? secs[1] : plan.length, c = 0, total = 0;
+  for (const x of plan) if (x.t === 'tts') total += x.text.length;
+  const cap = Math.min(2200, total * 0.3);
+  for (let i = 0; i < cut; i++) if (plan[i].t === 'tts' && (c += plan[i].text.length) > cap) { cut = i + 1; break; }
+  const out = plan.slice(0, cut);
+  out.push({t:'sil', s:0.8});
+  if (EL.music) out.push({t:'chime', k:'outro'});
+  return out;
+}
+const segKey = x => [EL.model, x.v === 'T' ? EL.teacher : EL.native, x.speed, x.text].join('|');
+function planStats(plan) {
+  let chars = 0, secs = 0; const seen = new Set();
+  for (const x of plan) {
+    if (x.t === 'tts') { secs += x.text.length / (x.v === 'T' ? 15 : 13.5) / x.speed; const k = segKey(x); if (!seen.has(k)) { seen.add(k); chars += x.text.length; } }
+    else if (x.t === 'sil') secs += x.s;
+    else if (x.t === 'chime') secs += CHIME_LEN[x.k];
+  }
+  return {chars, secs, credits:Math.ceil(chars * elModel().factor)};
+}
+
+/* ---------- MP3: se unen los fragmentos sin recodificar la voz ---------- */
+const MP3_BR = {1:[0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320], 2:[0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]};
+const MP3_SR = {3:[44100, 48000, 32000], 2:[22050, 24000, 16000], 0:[11025, 12000, 8000]};
+function mp3Frames(u8) {
+  let i = 0;
+  if (u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) i = 10 + ((u8[6] & 127) << 21 | (u8[7] & 127) << 14 | (u8[8] & 127) << 7 | (u8[9] & 127)) + (u8[5] & 0x10 ? 10 : 0);
+  const chunks = []; let sr = 0, ch = 0, samples = 0, first = true;
+  while (i + 4 <= u8.length) {
+    const b1 = u8[i + 1], b2 = u8[i + 2];
+    if (u8[i] !== 0xFF || (b1 & 0xE0) !== 0xE0) { i++; continue; }
+    const ver = (b1 >> 3) & 3, layer = (b1 >> 1) & 3, bri = b2 >> 4, sri = (b2 >> 2) & 3, mode = u8[i + 3] >> 6;
+    if (ver === 1 || layer !== 1 || bri === 0 || bri === 15 || sri === 3) { i++; continue; }
+    const rate = MP3_SR[ver][sri], len = Math.floor((ver === 3 ? 144000 : 72000) * MP3_BR[ver === 3 ? 1 : 2][bri] / rate) + ((b2 >> 1) & 1);
+    if (i + len > u8.length) break;
+    if (first) {
+      first = false;
+      const o = i + 4 + (ver === 3 ? (mode === 3 ? 17 : 32) : (mode === 3 ? 9 : 17)), tag = String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+      if (tag === 'Xing' || tag === 'Info' || String.fromCharCode(u8[i + 36], u8[i + 37], u8[i + 38], u8[i + 39]) === 'VBRI') { i += len; continue; }
+    }
+    sr = rate; ch = mode === 3 ? 1 : 2; samples += ver === 3 ? 1152 : 576;
+    chunks.push(u8.subarray(i, i + len));
+    i += len;
+  }
+  return {chunks, sr, ch, samples};
+}
+function concatU8(parts) { let n = 0; for (const p of parts) n += p.length; const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; }
+let lameP = null;
+function loadLame() {
+  if (window.lamejs && window.lamejs.Mp3Encoder) return Promise.resolve(window.lamejs);
+  return lameP || (lameP = new Promise((res, rej) => {
+    const srcs = ['vendor/lame.min.js', 'https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js'];
+    const next = i => {
+      if (i >= srcs.length) { lameP = null; rej({code:'lame'}); return; }
+      const s = document.createElement('script');
+      s.src = srcs[i];
+      s.onload = () => window.lamejs && window.lamejs.Mp3Encoder ? res(window.lamejs) : next(i + 1);
+      s.onerror = () => { s.remove(); next(i + 1); };
+      document.head.appendChild(s);
+    };
+    next(0);
+  }));
+}
+function encodePCM(lame, pcm, sr, ch) {
+  const enc = new lame.Mp3Encoder(ch, sr, 64), parts = [], B = 1152;
+  for (let i = 0; i < pcm.length; i += B) {
+    const n = Math.min(B, pcm.length - i), b = new Int16Array(n);
+    for (let j = 0; j < n; j++) b[j] = clamp(pcm[i + j], -1, 1) * 32767 | 0;
+    const r = ch === 2 ? enc.encodeBuffer(b, b) : enc.encodeBuffer(b);
+    if (r.length) parts.push(new Uint8Array(r));
+  }
+  const fl = enc.flush(); if (fl.length) parts.push(new Uint8Array(fl));
+  return mp3Frames(concatU8(parts));
+}
+/* Cortinillas: marimba suave sintetizada aquí mismo (no gastan créditos) */
+const CHIME_NOTES = {intro:[[523.25, 0], [659.25, .15], [783.99, .3], [1046.5, .45]], section:[[783.99, 0], [1046.5, .17]], sub:[[880, 0]], outro:[[1046.5, 0], [783.99, .15], [659.25, .3], [523.25, .45]]};
+function chimePCM(k, sr) {
+  const n = Math.round(CHIME_LEN[k] * sr), out = new Float32Array(n);
+  for (const [fq, t0] of CHIME_NOTES[k]) {
+    const s0 = Math.round(t0 * sr);
+    for (let i = s0; i < n; i++) { const t = (i - s0) / sr, w = 2 * Math.PI * fq * t; out[i] += Math.min(1, t / 0.005) * Math.exp(-3 * t) * (Math.sin(w) + 0.3 * Math.exp(-2 * t) * Math.sin(2 * w) + 0.1 * Math.exp(-4 * t) * Math.sin(3 * w)); }
+  }
+  if (k === 'intro' || k === 'outro') for (let i = 0; i < n; i++) { const t = i / sr; out[i] += 0.35 * Math.min(1, t / 0.4) * Math.exp(-1.2 * t) * (Math.sin(2 * Math.PI * 130.81 * t) + 0.6 * Math.sin(2 * Math.PI * 196 * t)); }
+  let peak = 0; for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+  const g = (k === 'sub' ? 0.18 : 0.3) / (peak || 1), fade = Math.round(0.08 * sr);
+  for (let i = 0; i < n; i++) out[i] *= g * (i > n - fade ? (n - i) / fade : 1);
+  return out;
+}
+const UNITS = {};
+function audioUnits(lame, sr, ch) {
+  const k = sr + '|' + ch;
+  if (!UNITS[k]) { UNITS[k] = {sil:encodePCM(lame, new Float32Array(sr * 10), sr, ch), chime:{}}; for (const c of Object.keys(CHIME_NOTES)) UNITS[k].chime[c] = encodePCM(lame, chimePCM(c, sr), sr, ch); }
+  return UNITS[k];
+}
+async function assemble(plan) {
+  const lame = await loadLame(), segs = new Map(), parts = [];
+  const seg = async x => {
+    const k = segKey(x);
+    if (!segs.has(k)) { const b = await IDB.get('seg', k); if (!b) throw {code:'missing'}; segs.set(k, mp3Frames(new Uint8Array(b))); }
+    return segs.get(k);
+  };
+  const f0 = await seg(plan.find(x => x.t === 'tts'));
+  const {sr, ch} = f0, spf = sr >= 32000 ? 1152 : 576, U = audioUnits(lame, sr, ch);
+  let samples = 0;
+  const add = fr => { for (const c of fr.chunks) parts.push(c); samples += fr.samples; };
+  for (const x of plan) {
+    if (x.t === 'tts') { const fr = await seg(x); if (fr.sr !== sr || fr.ch !== ch) throw {code:'format'}; add(fr); }
+    else if (x.t === 'chime') add(U.chime[x.k]);
+    else if (x.t === 'sil') {
+      let k = Math.round(x.s * sr / spf); const all = U.sil.chunks;
+      while (k > 0) { const n = Math.min(k, all.length); for (let i = 0; i < n; i++) parts.push(all[i]); samples += n * spf; k -= n; }
+    }
+  }
+  return {blob:new Blob(parts, {type:'audio/mpeg'}), secs:samples / sr};
+}
+
+/* ---------- API de ElevenLabs ---------- */
+async function elFetch(path, opts = {}) {
+  const r = await fetch(EL_API + path, Object.assign({}, opts, {headers:Object.assign({'xi-api-key':EL.key}, opts.headers || {})}));
+  if (!r.ok) {
+    let j = null; try { j = await r.json(); } catch (e) {}
+    const d = j && j.detail;
+    throw {code:'api', http:r.status, status:String((d && (d.status || d.code)) || ''), raw:String((d && (typeof d === 'string' ? d : d.message || (Array.isArray(d) ? d.map(x => x.msg).join('; ') : ''))) || r.statusText || '')};
+  }
+  return r;
+}
+const elPost = (path, body) => elFetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.json());
+function elMsg(e) {
+  if (!e || e.name === 'AbortError' || e.code === 'cancelled') return '';
+  if (e.code === 'lame') return 'No se pudo cargar el montador de audio (vendor/lame.min.js). Revisa tu conexión y vuelve a intentarlo.';
+  if (e.code === 'format' || e.code === 'missing') return 'Algunos fragmentos no se pudieron unir. Pulsa «Continuar» para volver a intentarlo.';
+  if (e.code !== 'api') return 'No se pudo conectar con ElevenLabs. Revisa tu conexión a internet y pulsa «Continuar».';
+  const s = (e.status + ' ' + e.raw).toLowerCase();
+  if (/quota|credit/.test(s)) return 'No te quedan créditos suficientes este mes. Lo ya generado está guardado: cuando tengas más créditos, pulsa «Continuar» y no se volverá a cobrar.';
+  if (/free_users_not_allowed|library voice|upgrade/.test(s)) return 'Con el plan gratuito, ElevenLabs no deja usar voces de su biblioteca desde la app. Diseña la voz del profesor en Ajustes (queda como voz tuya y sí funciona gratis) o elige una voz «predeterminada».';
+  if (/unusual|abuse/.test(s)) return 'ElevenLabs ha bloqueado el uso gratuito por «actividad inusual» (suele pasar con VPN o redes compartidas). Desactiva la VPN o cambia de red; con un plan de pago no ocurre.';
+  if (/permission/.test(s)) return 'A tu clave le falta un permiso (' + e.raw + '). Edítala en ElevenLabs → Developers → API Keys y activa los permisos que se indican en Ajustes.';
+  if (e.http === 401 || /invalid_api_key/.test(s)) return 'La clave de ElevenLabs no es válida. Revísala en Ajustes.';
+  if (/voice_not_found/.test(s) || e.http === 404) return 'ElevenLabs no encuentra esa voz. Elige otra en Ajustes.';
+  if (e.http === 429) return 'ElevenLabs está saturado o recibió demasiadas peticiones a la vez. Espera un minuto y pulsa «Continuar».';
+  return 'ElevenLabs respondió: ' + (e.raw || 'error ' + e.http);
+}
+const retryable = e => e && (e.code === 'api' ? (e.http === 429 && !/quota/i.test(e.status + e.raw)) || e.http >= 500 : e.name === 'TypeError');
+async function ttsSeg(x, signal) {
+  const m = elModel(), voice = x.v === 'T' ? EL.teacher : EL.native;
+  const body = {text:x.text, model_id:m.id, voice_settings:x.v === 'T' ? {stability:0.45, similarity_boost:0.8, style:0.15, use_speaker_boost:true, speed:x.speed} : {stability:0.6, similarity_boost:0.8, style:0, use_speaker_boost:true, speed:x.speed}};
+  if (m.lang && x.v === 'N') body.language_code = 'en';
+  for (let a = 0; ; a++) {
+    try {
+      const r = await elFetch(`/v1/text-to-speech/${encodeURIComponent(voice)}?output_format=mp3_44100_64`, {method:'POST', headers:{'Content-Type':'application/json', Accept:'audio/mpeg'}, body:JSON.stringify(body), signal});
+      return await r.arrayBuffer();
+    } catch (e) {
+      if (a < 4 && retryable(e) && !signal.aborted) { await sleep(2000 * 2 ** a); continue; }
+      throw e;
+    }
+  }
+}
+async function pool(items, n, fn, signal) {
+  let i = 0, err = null;
+  const worker = async () => { while (!err && i < items.length) { if (signal.aborted) { err = {name:'AbortError'}; break; } const x = items[i++]; try { await fn(x); } catch (e) { err = err || e; } } };
+  await Promise.all(Array.from({length:Math.min(n, items.length)}, worker));
+  if (err) throw err;
+}
+/* Genera las voces que falten (las ya generadas se reutilizan gratis) y monta el MP3 */
+async function runPlan(plan, g) {
+  const jobs = [], seen = new Set();
+  for (const x of plan) if (x.t === 'tts') { const k = segKey(x); if (!seen.has(k)) { seen.add(k); jobs.push(x); } }
+  const have = await Promise.all(jobs.map(x => IDB.has('seg', segKey(x)).catch(() => false)));
+  const todo = jobs.filter((x, i) => !have[i]);
+  g.total = jobs.length; g.done = jobs.length - todo.length; g.phase = 'tts'; genProgress(g);
+  await pool(todo, 2, async x => {
+    const buf = await ttsSeg(x, g.ctl.signal);
+    await IDB.put('seg', segKey(x), buf);
+    g.done++; g.spent += Math.ceil(x.text.length * elModel().factor); genProgress(g);
+  }, g.ctl.signal);
+  g.phase = 'mix'; genProgress(g);
+  const {blob, secs} = await assemble(plan);
+  return {buf:await blob.arrayBuffer(), secs, keys:jobs.map(segKey)};
+}
+let wakeLock = null;
+async function keepAwake(on) { try { if (on && 'wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {} }
+async function generateAudio(lessonId, kind, sample) {
+  if (genBusy) { toast('Ya se está generando otro audio. Espera a que termine.'); return; }
+  if (!EL.key) { toast('Primero añade tu clave de ElevenLabs.'); openElSettings(); return; }
+  const l = lessonById(lessonId), script = audioScript(l, kind);
+  if (!script) return;
+  const full = planAudio(script), plan = sample ? samplePlan(full) : full;
+  const gk = aid(lessonId, kind), id = aid(lessonId, kind, sample);
+  const g = GEN[gk] = {key:gk, sample:!!sample, phase:'prep', done:0, total:0, spent:0, err:'', ctl:new AbortController()};
+  genBusy = gk; render(); keepAwake(true);
+  try {
+    const {buf, secs, keys} = await runPlan(plan, g);
+    await IDB.put('audio', id, buf);
+    AMETA[id] = {secs:Math.round(secs), bytes:buf.byteLength, at:Date.now(), model:EL.model, v:hash(script)};
+    if (!sample) {
+      const sid = aid(lessonId, kind, true);
+      delete AMETA[sid]; delete APOS[sid];
+      IDB.del('audio', sid).catch(() => {});
+      IDB.del('seg', keys).catch(() => {});
+    }
+    saveAMeta(); delete GEN[gk];
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+    toast(sample ? 'Muestra lista' : 'Audio listo: ya puedes escucharlo o descargarlo');
+    if (sample) playAudio(id);
+  } catch (e) {
+    g.err = elMsg(e);
+    if (g.err) g.phase = 'error'; else { delete GEN[gk]; toast('Generación pausada. Lo ya generado está guardado.'); }
+  } finally {
+    genBusy = null; keepAwake(false); render(); elRefreshSub();
+  }
+}
+async function testVoices() {
+  if (genBusy || !EL.key) return;
+  const g = GEN.test = {key:'test', phase:'prep', done:0, total:0, spent:0, err:'', ctl:new AbortController()};
+  genBusy = 'test'; UI.elMsg = ''; render();
+  try {
+    const {buf, secs} = await runPlan(planAudio(TEST_SCRIPT), g);
+    await IDB.put('audio', 'test', buf);
+    AMETA.test = {secs:Math.round(secs), bytes:buf.byteLength, at:Date.now()};
+    delete GEN.test;
+    playAudio('test');
+  } catch (e) { delete GEN.test; UI.elMsg = elMsg(e); }
+  finally { genBusy = null; render(); elRefreshSub(); }
+}
+function genProgress(g) { document.querySelectorAll(`[data-prog="${g.key}"]`).forEach(el => { el.innerHTML = genProgressHTML(g); }); }
+function genProgressHTML(g) {
+  const txt = g.phase === 'prep' ? 'Preparando…' : g.phase === 'mix' ? 'Montando el audio con pausas y música…' : `Generando voces: ${g.done} de ${g.total} fragmentos${g.spent ? ' · ' + fmtN(g.spent) + ' créditos gastados' : ''}`;
+  return `${bar(g.phase === 'mix' ? 100 : g.total ? g.done / g.total * 100 : 0)}<span class="small muted num">${txt}</span>`;
+}
+async function elRefreshSub(report) {
+  if (!EL.key) { ELSUB = null; return; }
+  try {
+    const j = await (await elFetch('/v1/user/subscription')).json();
+    ELSUB = {used:j.character_count || 0, limit:j.character_limit || 0, reset:j.next_character_count_reset_unix || 0, tier:j.tier || ''};
+    if (report) UI.elMsg = 'Clave guardada. Conexión correcta' + (ELSUB.tier ? ' · plan ' + ELSUB.tier : '') + '.';
+  } catch (e) {
+    if (report) UI.elMsg = e.code === 'api' && /permission/i.test(e.status + e.raw) ? 'Clave guardada. No puedo mostrar tus créditos porque a la clave le falta el permiso «User: Read» (es opcional).' : elMsg(e);
+  }
+  document.querySelectorAll('[data-credits]').forEach(el => { el.innerHTML = creditsChip(); });
+  if (report) render();
+}
+function creditsChip() {
+  if (!ELSUB || !ELSUB.limit) return '';
+  const left = Math.max(0, ELSUB.limit - ELSUB.used);
+  const r = ELSUB.reset ? ' · se renuevan el ' + new Intl.DateTimeFormat('es', {day:'numeric', month:'short'}).format(new Date(ELSUB.reset * 1000)) : '';
+  return `<span class="chip ${left < 1500 ? 'warn' : 'accent'} num" title="Créditos de ElevenLabs">${fmtN(left)} créditos${r}</span>`;
+}
+async function designVoice() {
+  if (DESIGN.desc.trim().length < 20) { DESIGN.err = 'Describe la voz con al menos 20 caracteres.'; render(); return; }
+  if (DESIGN.text.trim().length < 100) { DESIGN.err = 'El texto de prueba debe tener al menos 100 caracteres.'; render(); return; }
+  DESIGN.busy = true; DESIGN.err = ''; DESIGN.previews = []; render();
+  try {
+    let j;
+    try { j = await elPost('/v1/text-to-voice/design', {voice_description:DESIGN.desc.trim(), model_id:'eleven_multilingual_ttv_v2', text:DESIGN.text.trim()}); }
+    catch (e) { if (e.http === 404 || e.http === 405) j = await elPost('/v1/text-to-voice/create-previews', {voice_description:DESIGN.desc.trim(), text:DESIGN.text.trim()}); else throw e; }
+    DESIGN.previews = (j.previews || []).map(p => ({gid:p.generated_voice_id, src:`data:${p.media_type || 'audio/mpeg'};base64,${p.audio_base_64}`}));
+    if (!DESIGN.previews.length) DESIGN.err = 'ElevenLabs no devolvió propuestas. Prueba a cambiar la descripción.';
+  } catch (e) { DESIGN.err = elMsg(e); }
+  DESIGN.busy = false; render(); elRefreshSub();
+}
+async function saveDesigned(i) {
+  const p = DESIGN.previews[i]; if (!p) return;
+  const name = 'Profesor Ruta C2 ' + new Date().toLocaleDateString('es');
+  try {
+    let j; const body = {voice_name:name, voice_description:DESIGN.desc.trim(), generated_voice_id:p.gid};
+    try { j = await elPost('/v1/text-to-voice', body); }
+    catch (e) { if (e.http === 404 || e.http === 405) j = await elPost('/v1/text-to-voice/create-voice-from-preview', body); else throw e; }
+    EL.mine = EL.mine.filter(v => v.id !== j.voice_id).concat([{id:j.voice_id, name, d:'diseñada por ti'}]);
+    EL.teacher = j.voice_id; saveEL(); DESIGN.previews = [];
+    toast('Voz guardada y elegida para el profesor');
+  } catch (e) { DESIGN.err = elMsg(e); }
+  render();
+}
+async function loadMyVoices() {
+  try {
+    const j = await (await elFetch('/v1/voices')).json();
+    EL.mine = (j.voices || []).filter(v => v.category !== 'premade').map(v => ({id:v.voice_id, name:v.name, d:[v.category === 'generated' ? 'diseñada por ti' : v.category, v.labels && v.labels.accent].filter(Boolean).join(' · ')}));
+    saveEL(); UI.elMsg = EL.mine.length ? `Cargadas ${EL.mine.length} voces de tu cuenta.` : 'Tu cuenta no tiene voces propias todavía.';
+  } catch (e) { UI.elMsg = elMsg(e); }
+  render();
+}
+
+/* ---------- Reproductor, descarga y compartir ---------- */
+const PL = {url:null, id:null, saved:0};
+function audioTitle(id) {
+  if (id === 'test') return ['Prueba de voces', 'Ajustes de audio'];
+  const [lid, kind, smp] = id.split('|'), l = lessonById(lid);
+  return [(l ? l.title : 'Lección') + ' · ' + AKINDS[kind].label + (smp ? ' (muestra)' : ''), l ? `${l.level} · ${l.es}` : ''];
+}
+function playerEl() {
+  let p = $('#player');
+  if (p) return p;
+  p = document.createElement('div');
+  p.id = 'player'; p.className = 'player'; p.hidden = true;
+  p.innerHTML = `<div class="pl-head"><span class="pl-ico">${ic('headphones')}</span><div class="pl-t"><b id="pl-title"></b><small id="pl-sub"></small></div><button class="icon-btn" data-act="pl-close" aria-label="Cerrar reproductor">${ic('x')}</button></div><audio id="pl-audio" controls preload="auto"></audio>`;
+  document.body.appendChild(p);
+  const a = $('#pl-audio');
+  a.addEventListener('loadedmetadata', () => { const t = APOS[PL.id]; if (t && t < a.duration - 15) a.currentTime = t; });
+  a.addEventListener('timeupdate', () => { if (!PL.id || PL.id === 'test' || Date.now() - PL.saved < 4000) return; PL.saved = Date.now(); APOS[PL.id] = Math.floor(a.currentTime); saveJSON(APOS_KEY, APOS); });
+  a.addEventListener('ended', () => { delete APOS[PL.id]; saveJSON(APOS_KEY, APOS); });
+  return p;
+}
+async function playAudio(id) {
+  let buf = null; try { buf = await IDB.get('audio', id); } catch (e) {}
+  if (!buf) { toast('No encuentro este audio en este navegador.'); return; }
+  const p = playerEl(), a = $('#pl-audio'), [title, sub] = audioTitle(id);
+  if (PL.url) URL.revokeObjectURL(PL.url);
+  PL.url = URL.createObjectURL(new Blob([buf], {type:'audio/mpeg'})); PL.id = id;
+  a.src = PL.url; $('#pl-title').textContent = title; $('#pl-sub').textContent = sub;
+  p.hidden = false; document.body.classList.add('has-player');
+  if ('mediaSession' in navigator && window.MediaMetadata) try { navigator.mediaSession.metadata = new MediaMetadata({title, artist:'Ruta al C2', album:sub}); } catch (e) {}
+  try { await a.play(); } catch (e) {}
+}
+function closePlayer() { const a = $('#pl-audio'); if (a) a.pause(); const p = $('#player'); if (p) p.hidden = true; document.body.classList.remove('has-player'); }
+function audioFileName(id) {
+  const [lid, kind, smp] = id.split('|'), l = lessonById(lid);
+  const n = l && !l.ai ? `${l.level}-${pad(lessonNo(l))} ` : '';
+  return `Ruta C2 ${n}${l ? l.title : lid} - ${AKINDS[kind].file}${smp ? ' (muestra)' : ''}.mp3`.replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, ' ');
+}
+async function audioFile(id) { const buf = await IDB.get('audio', id).catch(() => null); return buf ? new File([buf], audioFileName(id), {type:'audio/mpeg'}) : null; }
+async function downloadAudio(id) {
+  const f = await audioFile(id);
+  if (!f) { toast('No encuentro este audio en este navegador.'); return; }
+  const url = URL.createObjectURL(f), a = document.createElement('a');
+  a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function shareAudio(id) {
+  const f = await audioFile(id);
+  if (!f) { toast('No encuentro este audio en este navegador.'); return; }
+  if (navigator.canShare && navigator.canShare({files:[f]})) { try { await navigator.share({files:[f], title:f.name}); } catch (e) {} }
+  else downloadAudio(id);
+}
+async function deleteAudio(id) {
+  await IDB.del('audio', id).catch(() => {});
+  delete AMETA[id]; delete APOS[id]; saveAMeta(); saveJSON(APOS_KEY, APOS);
+  if (PL.id === id) closePlayer();
+}
+function openElSettings() { go('settings'); setTimeout(() => { const s = $('#el-settings'); if (s) s.scrollIntoView({behavior:'smooth', block:'start'}); }, 60); }
+
+/* ---------- Componentes ---------- */
+function audioRow(l, kind) {
+  const K = AKINDS[kind], script = audioScript(l, kind), id = aid(l.id, kind), sid = aid(l.id, kind, true);
+  if (!script) return `<div class="arow off"><span class="arow-i">${ic(K.icon)}</span><div class="arow-body"><div class="arow-t"><b>${K.label}</b><span class="small muted">Guion en preparación. Pídele a Claude que escriba los guiones de audio de esta lección.</span></div></div></div>`;
+  const meta = AMETA[id], g = GEN[id], busy = !!genBusy;
+  let info, acts;
+  if (g && g.phase !== 'error') {
+    info = `<div class="arow-prog" data-prog="${id}">${genProgressHTML(g)}</div>`;
+    acts = `<button class="btn sm" data-act="aud-stop" data-id="${id}">Pausar</button><span class="small muted">Deja esta pestaña abierta mientras se genera.</span>`;
+  } else if (meta) {
+    const stale = meta.v !== hash(script);
+    info = `<span class="small muted num">Listo · ${fmtDur(meta.secs)} min · ${fmtMB(meta.bytes)}${stale ? ' · <b>hay una versión nueva del guion</b>' : ''}</span>`;
+    acts = `<button class="btn sm primary" data-act="aud-play" data-id="${id}">${ic('play')}Escuchar</button><button class="btn sm" data-act="aud-dl" data-id="${id}">${ic('download')}Descargar MP3</button>${canShareFiles ? `<button class="btn sm ghost" data-act="aud-share" data-id="${id}">${ic('share')}Compartir</button>` : ''}`;
+  } else {
+    const full = planAudio(script), st = planStats(full), ss = planStats(samplePlan(full));
+    info = `<span class="small muted num">≈ ${Math.max(1, Math.round(st.secs / 60))} min · ≈ ${fmtN(st.credits)} créditos con ${elModel().name}</span>`;
+    acts = `<button class="btn sm primary" data-act="aud-gen" data-id="${id}" ${busy ? 'disabled' : ''}>${ic('headphones')}Generar audio</button>`
+      + (AMETA[sid] ? `<button class="btn sm" data-act="aud-play" data-id="${sid}">${ic('play')}Escuchar muestra</button>` : `<button class="btn sm" data-act="aud-sample" data-id="${id}" ${busy ? 'disabled' : ''}>Probar una muestra · ≈ ${fmtN(ss.credits)} créditos</button>`);
+  }
+  const err = g && g.phase === 'error' ? `<div class="arow-err"><p class="small">${esc(g.err)}</p><div class="row"><button class="btn sm" data-act="${g.sample ? 'aud-sample' : 'aud-gen'}" data-id="${id}" ${busy ? 'disabled' : ''}>Continuar</button>${/Ajustes/.test(g.err) ? `<button class="btn sm ghost" data-act="el-setup">Ir a Ajustes</button>` : ''}</div></div>` : '';
+  const cf = UI.audConfirm && UI.audConfirm.id === id ? UI.audConfirm.what : '';
+  const confirm = cf ? `<div class="confirm"><b>${cf === 'del' ? 'Se borrará de este navegador. Si ya lo descargaste, conservas tu archivo.' : `Regenerarlo vuelve a gastar ≈ ${fmtN(planStats(planAudio(script)).credits)} créditos.`}</b><div class="row"><button class="btn sm danger" data-act="aud-yes" data-id="${id}">${cf === 'del' ? 'Sí, borrar' : 'Sí, regenerar'}</button><button class="btn sm" data-act="aud-no">Cancelar</button></div></div>` : '';
+  const open = UI.scriptOpen === id;
+  return `<div class="arow"><span class="arow-i">${ic(K.icon)}</span><div class="arow-body"><div class="arow-t"><b>${K.label}</b>${info}</div><div class="row arow-acts">${acts}</div>${err}
+    <div class="row arow-more"><button class="link small" data-act="aud-script" data-id="${id}">${open ? 'Ocultar guion' : 'Ver guion'}</button>${meta && !g ? `<button class="link small" data-act="aud-ask" data-w="regen" data-id="${id}">Regenerar</button><button class="link small" data-act="aud-ask" data-w="del" data-id="${id}">Borrar</button>` : ''}</div>${confirm}${open ? scriptView(script) : ''}</div></div>`;
+}
+function audioPanel(l, kinds) {
+  return `<section class="audio-panel">
+    <div class="row between"><div class="row ap-head"><span class="ap-ico">${ic('headphones')}</span><div><h3>Clase en audio</h3><p class="small muted">Para escuchar en el carro o en el gimnasio. Se genera una sola vez con ElevenLabs y queda guardada en este navegador.</p></div></div><span data-credits>${creditsChip()}</span></div>
+    ${EL.key ? '' : `<div class="ap-setup"><span class="small">Para generar audios, añade tu clave de ElevenLabs.</span><button class="btn sm" data-act="el-setup">${ic('gear')}Configurar ElevenLabs</button></div>`}
+    <div class="arows">${kinds.map(k => audioRow(l, k)).join('')}</div></section>`;
+}
+function scriptView(src) {
+  const MUS = {intro:'Música de entrada', outro:'Música de cierre', section:'Cortinilla', sub:'Pequeña cortinilla'}, rows = [];
+  for (const raw of String(src).split('\n')) {
+    const line = raw.trim(); let m;
+    if (!line || line.startsWith('//')) continue;
+    if ((m = line.match(/^~\s*(\w+)/))) rows.push(`<div class="sc-music">♪ ${MUS[m[1]] || ''}</div>`);
+    else if (line.startsWith('## ')) rows.push(`<h4 class="sc-h">${inl(line.slice(3))}</h4>`);
+    else if (line.startsWith('### ')) rows.push(`<h5 class="sc-h5">${inl(line.slice(4))}</h5>`);
+    else if ((m = line.match(/^P:\s*([\d.]+)/))) rows.push(`<div class="sc-pause">Pausa de ${m[1]} s</div>`);
+    else if ((m = line.match(/^([TNERQ]):\s*(.+)$/))) {
+      const k = m[1], b = m[2];
+      if (k === 'T') rows.push(`<p class="sc-t">${inl(b)}</p>`);
+      else if (k === 'Q') { const [q, a] = splitPipe(b); rows.push(`<div class="sc-q"><p>${inl(q)}</p>${a ? `<p class="sc-en">${speakBtn(a)}<span>${inl(a)}</span></p>` : ''}</div>`); }
+      else rows.push(`<p class="sc-en">${speakBtn(b)}<span>${inl(b)}</span>${k === 'R' ? '<small>despacio y normal · repite</small>' : k === 'E' ? '<small>repite</small>' : ''}</p>`);
+    }
+  }
+  return `<div class="script">${rows.join('')}</div>`;
+}
+function elSettings() {
+  const m = elModel();
+  const opts = role => voiceList(role).map(v => `<option value="${esc(v.id)}" ${EL[role] === v.id ? 'selected' : ''}>${esc(v.name)} — ${esc(v.d)}</option>`).join('')
+    + (voiceList(role).some(v => v.id === EL[role]) ? '' : `<option value="${esc(EL[role])}" selected>Voz personalizada (${esc(EL[role])})</option>`);
+  const seg = (act, cur, list) => `<span class="seg">${list.map(([v, t]) => `<button data-act="${act}" data-v="${v}" aria-pressed="${String(cur) === String(v)}">${t}</button>`).join('')}</span>`;
+  return `<section class="panel stack" id="el-settings"><h3>Clases en audio (ElevenLabs)</h3>
+    <p class="small muted">Tu clave se guarda solo en este navegador: no se sube a ningún sitio ni entra en la copia de seguridad.</p>
+    <details class="acc-mini" ${EL.key ? '' : 'open'}><summary>Cómo conseguir tu clave (2 minutos)</summary><ol class="small">
+      <li>Entra en <a href="https://elevenlabs.io/app/developers/api-keys" target="_blank" rel="noopener">elevenlabs.io → Developers → API Keys</a> y pulsa <b>Create API Key</b>.</li>
+      <li>Ponle un nombre (por ejemplo «Ruta C2») y activa los permisos <b>Text to Speech</b>, <b>Voices</b> (lectura y escritura), <b>Voice Generation</b> y <b>User</b> (lectura, para ver tus créditos).</li>
+      <li>Recomendado: ponle a la clave un límite de créditos.</li>
+      <li>Copia la clave y pégala aquí abajo.</li></ol></details>
+    <label class="field">Clave de API<input type="password" id="el-key" autocomplete="off" spellcheck="false" placeholder="sk_…" value="${esc(EL.key)}"></label>
+    <div class="row"><button class="btn primary" data-act="el-save">Guardar y comprobar</button>${EL.key ? '<button class="btn ghost" data-act="el-forget">Quitar clave</button>' : ''}<span data-credits>${creditsChip()}</span></div>
+    ${UI.elMsg ? `<p class="small">${esc(UI.elMsg)}</p>` : ''}
+    <div class="stack" style="gap:6px"><b>Modelo de voz</b>${seg('el-model', EL.model, EL_MODELS.map(x => [x.id, x.name]))}<span class="small muted">${m.note} Cambiarlo solo afecta a los audios que generes después.</span></div>
+    <label class="field">Voz del profesor (español latino)<select id="el-teacher">${opts('teacher')}</select></label>
+    <p class="small muted">Es posible que con el plan gratuito ElevenLabs no deje usar desde la app las voces de su biblioteca (con Starter sí). Si te pasa, <b>diseña la voz del profesor</b>: queda como voz tuya y funciona en todos los planes.</p>
+    <details class="acc-mini" ${DESIGN.previews.length || DESIGN.busy || DESIGN.err ? 'open' : ''}><summary>Diseñar la voz del profesor</summary><div class="stack" style="margin-top:10px">
+      <label class="field">Descripción de la voz (en inglés funciona mejor)<textarea id="ds-desc" rows="4">${esc(DESIGN.desc)}</textarea></label>
+      <label class="field">Texto que leerá en la prueba (mínimo 100 caracteres)<textarea id="ds-text" rows="3">${esc(DESIGN.text)}</textarea></label>
+      <div class="row"><button class="btn" data-act="el-design" ${DESIGN.busy || !EL.key ? 'disabled' : ''}>${ic('spark')}${DESIGN.busy ? 'Creando propuestas…' : 'Crear propuestas de voz'}</button><span class="small muted">Gasta unos pocos cientos de créditos.</span></div>
+      ${DESIGN.err ? `<p class="small" style="color:var(--bad)">${esc(DESIGN.err)}</p>` : ''}
+      ${DESIGN.previews.map((p, i) => `<div class="ds-prev"><b>Propuesta ${i + 1}</b><audio controls preload="none" src="${p.src}"></audio><button class="btn sm primary" data-act="el-design-save" data-i="${i}">Usar esta voz</button></div>`).join('')}
+    </div></details>
+    <label class="field">Voz del nativo (inglés británico)<select id="el-native">${opts('native')}</select></label>
+    <div class="row"><button class="btn sm" data-act="el-test" ${EL.key && !genBusy ? '' : 'disabled'}>${ic('speaker')}${GEN.test ? 'Generando prueba…' : 'Probar las dos voces · ≈ 70 créditos'}</button><button class="btn sm ghost" data-act="el-voices" ${EL.key ? '' : 'disabled'}>Cargar mis voces de ElevenLabs</button></div>
+    <div class="grid-2"><label class="field">Otra voz por su ID (opcional)<input type="text" id="el-custom" autocomplete="off" spellcheck="false" placeholder="Voice ID de ElevenLabs"></label><div class="row" style="align-self:end"><button class="btn sm" data-act="el-custom" data-role="teacher">Para el profesor</button><button class="btn sm" data-act="el-custom" data-role="native">Para el nativo</button></div></div>
+    <div class="stack" style="gap:6px"><b>Pausas para pensar y repetir</b>${seg('el-pause', EL.pause, [[0.75, 'Cortas'], [1, 'Normales'], [1.35, 'Largas']])}</div>
+    <div class="stack" style="gap:6px"><b>Cortinillas musicales entre temas</b>${seg('el-music', EL.music ? 1 : 0, [[1, 'Sí'], [0, 'No']])}<span class="small muted">Las crea la propia app: no gastan créditos.</span></div>
+  </section>`;
+}
+
+/* =========================================================
    IA (Claude) — opcional
    ========================================================= */
 let SAMPLE = null, aiState = 'unknown';
@@ -433,7 +1033,7 @@ let R = {name:'home', p:{}};
 const stack = [];
 let SESSION = null;   // sesión de ejercicios
 let FLASH = null;     // sesión de tarjetas
-let UI = {grammarLevel:null, grammarQuery:'', mistFilter:'pending', vocabLevel:'all', reviewLevel:'all', reviewCount:15, tutorTab:'write', guideOpen:'g-levels', confirmReset:false, importText:'', importMsg:''};
+let UI = {grammarLevel:null, grammarQuery:'', mistFilter:'pending', vocabLevel:'all', reviewLevel:'all', reviewCount:15, tutorTab:'write', guideOpen:'g-levels', confirmReset:false, importText:'', importMsg:'', scriptOpen:null, audConfirm:null, elMsg:''};
 const AI = {extra:{}, explain:{}, write:{level:null, prompt:'', text:'', busy:false, result:null, err:'', ctl:null}, chat:{turns:[], busy:false, err:'', ctl:null, draft:''}, gen:{topic:'', level:null, busy:false, err:''}};
 
 function go(name, p = {}, push = true) {
@@ -457,6 +1057,7 @@ const NAV = [
   {id:'review', label:'Repaso', icon:'repeat'},
   {id:'mistakes', label:'Mis errores', icon:'alert'},
   {id:'vocab', label:'Vocabulario', icon:'cards'},
+  {id:'audio', label:'Audios', icon:'headphones'},
   {id:'tutor', label:'Tutor IA', icon:'spark'},
   {id:'guide', label:'Plan C2', icon:'map'},
   {id:'settings', label:'Ajustes', icon:'gear'}
@@ -477,7 +1078,7 @@ function renderNav() {
     <div class="side-foot"><div class="sync" id="sync"></div></div>`;
   const tb = $('#tabbar');
   const tabs = [NAV[0], NAV[1], NAV[2], NAV[4], {id:'more', label:'Más', icon:'more'}];
-  const moreIds = ['mistakes', 'tutor', 'guide', 'settings', 'more'];
+  const moreIds = ['mistakes', 'audio', 'tutor', 'guide', 'settings', 'more'];
   if (tb) tb.innerHTML = tabs.map(n => {
     const on = n.id === 'more' ? moreIds.includes(cur) : cur === n.id;
     const dot = (n.id === 'review' && dueLessons().length) || (n.id === 'more' && pendingMistakes().length) ? '<span class="dot"></span>' : '';
@@ -690,14 +1291,29 @@ function viewLesson() {
     <div class="seg" role="tablist">
       <button data-act="ltab" data-tab="theory" aria-pressed="${tab === 'theory'}">Teoría</button>
       <button data-act="ltab" data-tab="practice" aria-pressed="${tab === 'practice'}">Práctica · ${l.ex.length}</button>
+      ${l.ai ? '' : `<button data-act="ltab" data-tab="phrases" aria-pressed="${tab === 'phrases'}">Frases nativas</button>
+      <button data-act="ltab" data-tab="words" aria-pressed="${tab === 'words'}">Vocabulario</button>`}
       <button data-act="ltab" data-tab="errors" aria-pressed="${tab === 'errors'}">Tus errores${pend.length ? ' · ' + pend.length : ''}</button>
     </div></div>`;
   let body = '';
   if (tab === 'theory') {
-    body = `<div class="theory-layout"><article class="theory">${html}
+    body = `${l.ai ? '' : audioPanel(l, Object.keys(AKINDS))}<div class="theory-layout"><article class="theory">${html}
       <div class="lesson-cta"><h3>¿Listo para practicar?</h3><p>${plural(l.ex.length, 'ejercicio', 'ejercicios')} con corrección inmediata. Tus fallos se guardan para repasarlos.</p>
       <div class="row"><button class="btn primary lg" data-act="start-lesson" data-id="${esc(l.id)}">${ic('play')}Empezar práctica</button>${aiState === 'ready' ? `<button class="btn" data-act="ask-tutor" data-id="${esc(l.id)}">${ic('chat')}Preguntar una duda</button>` : ''}</div></div>
     </article><nav class="toc" aria-label="Índice"><span class="eyebrow" style="padding:0 10px 6px">En esta lección</span>${toc.map(t => `<a href="#${t.id}" data-act="toc" data-id="${t.id}">${esc(t.t)}</a>`).join('')}</nav></div>`;
+  } else if (tab === 'phrases') {
+    const A = AUDIO[l.id] || {}, ch = A.chunks || [], dr = A.drills || [];
+    body = audioPanel(l, ['chunks']) + (!ch.length && !dr.length ? '<div class="empty">Las frases nativas de esta lección están en preparación.</div>' : `
+      ${ch.length ? `<section class="stack"><div class="stack" style="gap:4px"><h2 class="sec-t">Frases nativas</h2><p class="muted">Bloques que los nativos usan tal cual. Apréndelos enteros, sin traducir palabra por palabra.</p></div>
+        <div class="chunks">${ch.map(c => `<div class="chunk"><div class="row" style="gap:8px;flex-wrap:nowrap">${speakBtn(c[0])}<b class="en">${esc(c[0])}</b></div><span class="es">${esc(c[1])}</span><div class="cx"><div class="row" style="gap:8px;flex-wrap:nowrap">${speakBtn(c[2])}<em>${esc(c[2])}</em></div><span>${esc(c[3])}</span></div>${c[4] ? `<span class="note">${esc(c[4])}</span>` : ''}</div>`).join('')}</div></section>` : ''}
+      ${dr.length ? `<section class="stack"><div class="stack" style="gap:4px"><h2 class="sec-t">Ejemplos de refuerzo</h2><p class="muted">Intenta decir cada frase en inglés, en voz alta, antes de abrirla.</p></div>
+        <div class="drills">${dr.map(d => `<details class="drill"><summary>${esc(d[0])}</summary><div class="row" style="gap:8px;flex-wrap:nowrap">${speakBtn(d[1])}<span class="en">${esc(d[1])}</span></div>${d[2] ? `<p class="small muted">${esc(d[2])}</p>` : ''}</details>`).join('')}</div></section>` : ''}`);
+  } else if (tab === 'words') {
+    const dk = lessonDeck(l.id);
+    const lbl = {new:'Nueva', learning:'Aprendiendo', learned:'Aprendida', mastered:'Dominada'}, cls = {new:'', learning:'warn', learned:'accent', mastered:'good'};
+    body = audioPanel(l, ['vocab']) + (!dk ? '<div class="empty">El vocabulario de esta lección está en preparación.</div>' : `<section class="stack">
+      <div class="row between"><div class="stack" style="gap:4px"><h2 class="sec-t">Vocabulario de la lección</h2><p class="muted">${plural(dk.words.length, 'palabra o expresión', 'palabras y expresiones')} que encajan con el tema. Estúdialas con tarjetas: entran en tus repasos de Vocabulario.</p></div><button class="btn primary" data-act="deck-study" data-id="${esc(dk.id)}">${ic('play')}Estudiar con tarjetas</button></div>
+      <div class="wordlist">${AUDIO[l.id].vocab.map(w => { const st = wordState(card(cardKey(dk.id, w[0]))); return `<div class="wl">${speakBtn(w[0]) || '<span></span>'}<div><b>${esc(w[0])}</b><span class="d">${esc(w[1])}</span>${w[4] ? `<span class="d note">${esc(w[4])}</span>` : ''}</div><div class="wl-ex"><div class="row" style="gap:6px;flex-wrap:nowrap">${speakBtn(w[2])}<em>${esc(w[2])}</em></div><span class="d">${esc(w[3])}</span></div><div class="wl-st"><span class="chip ${cls[st]}">${lbl[st]}</span></div></div>`; }).join('')}</div></section>`);
   } else if (tab === 'practice') {
     const ex = AI.extra[l.id] || {};
     body = `<section class="grid-2">
@@ -1274,6 +1890,7 @@ function viewSettings() {
     <div class="stack" style="gap:6px"><b>Velocidad</b>${segBtns('set-rate', 'rate', [[0.8, 'Lenta'], [0.95, 'Normal'], [1.1, 'Rápida']])}</div>
     <button class="btn" data-act="say" data-say="The quick brown fox jumps over the lazy dog." style="align-self:flex-start">${ic('speaker')}Probar la voz</button>` : '<p class="muted">Tu navegador no ofrece voz sintética.</p>'}
   </section>
+  ${elSettings()}
   <section class="panel stack"><h3>Copia de seguridad</h3>
     <p class="small muted">${sync === 'cloud' ? 'Tu progreso se guarda automáticamente en tu cuenta y en este navegador.' : 'Tu progreso se guarda en este navegador. Copia una copia de seguridad para llevarla a otro dispositivo.'}</p>
     <div class="row"><button class="btn" data-act="export">${ic('copy')}Copiar mi progreso</button></div>
@@ -1284,14 +1901,25 @@ function viewSettings() {
     ${UI.confirmReset ? `<div class="confirm"><b>¿Seguro? Se borrará todo tu progreso, errores y tarjetas.</b><div class="row"><button class="btn danger" data-act="reset-yes">Sí, borrar todo</button><button class="btn" data-act="reset-no">Cancelar</button></div></div>` : `<button class="btn danger" data-act="reset" style="align-self:flex-start">${ic('trash')}Borrar mi progreso</button>`}
   </section>`;
 }
+function viewAudio() {
+  const ls = GRAMMAR.filter(l => AUDIO[l.id]);
+  const made = Object.keys(AMETA).filter(k => k.split('|').length === 2).length;
+  return `${pageHead('Clases en audio', 'Teoría, refuerzo con frases nativas y vocabulario de cada lección, para escuchar mientras conduces o entrenas.')}
+  <section class="panel stack"><div class="row between"><h3>Tu cuenta de ElevenLabs</h3><span data-credits>${creditsChip()}</span></div>
+    ${EL.key ? `<p class="small muted">Modelo <b>${esc(elModel().name)}</b> · profesor: <b>${esc(voiceName('teacher', EL.teacher))}</b> · nativo: <b>${esc(voiceName('native', EL.native))}</b></p>` : '<p class="small">Aún no has añadido tu clave de ElevenLabs.</p>'}
+    <p class="small muted">${plural(made, 'audio generado', 'audios generados')} · guiones listos en ${ls.length} de ${GRAMMAR.length} lecciones. Los audios se guardan en este navegador; descárgalos para tenerlos siempre en el teléfono.</p>
+    <div class="row"><button class="btn sm" data-act="el-setup">${ic('gear')}Ajustes de audio</button></div></section>
+  ${ls.map(l => `<section class="panel stack"><div class="row between"><div class="row" style="gap:8px">${lvChip(l.level)}<b>${esc(l.title)}</b></div><button class="btn sm ghost" data-act="open-lesson" data-id="${esc(l.id)}">Abrir lección${ic('right')}</button></div><div class="arows">${Object.keys(AKINDS).map(k => audioRow(l, k)).join('')}</div></section>`).join('')}
+  ${ls.length < GRAMMAR.length ? '<div class="empty">Las demás lecciones tendrán sus guiones más adelante. Cuando quieras más, pídele a Claude: «escribe los guiones de audio de las lecciones …».</div>' : ''}`;
+}
 function viewMore() {
-  return `${pageHead('Más', '')}<div class="sheet">${[NAV[3], NAV[5], NAV[6], NAV[7]].map(n => `<button data-act="nav" data-to="${n.id}">${ic(n.icon)}<span style="flex:1">${n.label}</span>${navBadge(n.id)}</button>`).join('')}</div><div class="sync" id="sync2"></div>`;
+  return `${pageHead('Más', '')}<div class="sheet">${['mistakes', 'audio', 'tutor', 'guide', 'settings'].map(id => NAV.find(n => n.id === id)).map(n => `<button data-act="nav" data-to="${n.id}">${ic(n.icon)}<span style="flex:1">${n.label}</span>${navBadge(n.id)}</button>`).join('')}</div><div class="sync" id="sync2"></div>`;
 }
 
 /* =========================================================
    Render principal
    ========================================================= */
-const VIEWS = {home:viewHome, grammar:viewGrammar, lesson:viewLesson, quiz:viewQuiz, review:viewReview, mistakes:viewMistakes, vocab:viewVocab, deck:viewDeck, flash:viewFlash, tutor:viewTutor, guide:viewGuide, settings:viewSettings, more:viewMore};
+const VIEWS = {home:viewHome, grammar:viewGrammar, lesson:viewLesson, quiz:viewQuiz, review:viewReview, mistakes:viewMistakes, vocab:viewVocab, deck:viewDeck, flash:viewFlash, tutor:viewTutor, audio:viewAudio, guide:viewGuide, settings:viewSettings, more:viewMore};
 function render() {
   const v = $('#view'); if (!v) return;
   const fn = VIEWS[R.name] || viewHome;
@@ -1383,6 +2011,32 @@ document.addEventListener('click', e => {
       catch (err) { UI.importMsg = 'Ese texto no es una copia de seguridad válida. Usa «Copiar mi progreso» para obtener una.'; render(); }
       break;
     }
+    case 'aud-gen': case 'aud-sample': { const [lid, kind] = d.id.split('|'); generateAudio(lid, kind, a === 'aud-sample'); break; }
+    case 'aud-stop': { const g = GEN[d.id]; if (g) g.ctl.abort(); break; }
+    case 'aud-play': playAudio(d.id); break;
+    case 'aud-dl': downloadAudio(d.id); break;
+    case 'aud-share': shareAudio(d.id); break;
+    case 'aud-script': UI.scriptOpen = UI.scriptOpen === d.id ? null : d.id; render(); break;
+    case 'aud-ask': UI.audConfirm = {id:d.id, what:d.w}; render(); break;
+    case 'aud-no': UI.audConfirm = null; render(); break;
+    case 'aud-yes': {
+      const c = UI.audConfirm; UI.audConfirm = null;
+      if (!c) break;
+      deleteAudio(c.id).then(() => { if (c.what === 'regen') { const [lid, kind] = c.id.split('|'); generateAudio(lid, kind); } else { toast('Audio borrado'); render(); } });
+      break;
+    }
+    case 'pl-close': closePlayer(); break;
+    case 'el-setup': openElSettings(); break;
+    case 'el-save': { const v = (($('#el-key') || {}).value || '').trim(); EL.key = v; saveEL(); UI.elMsg = v ? 'Comprobando…' : ''; render(); if (v) elRefreshSub(true); break; }
+    case 'el-forget': EL.key = ''; ELSUB = null; UI.elMsg = 'Clave eliminada de este navegador.'; saveEL(); render(); break;
+    case 'el-model': EL.model = d.v; saveEL(); render(); break;
+    case 'el-pause': EL.pause = Number(d.v); saveEL(); render(); break;
+    case 'el-music': EL.music = d.v === '1'; saveEL(); render(); break;
+    case 'el-design': designVoice(); break;
+    case 'el-design-save': saveDesigned(Number(d.i)); break;
+    case 'el-voices': loadMyVoices(); break;
+    case 'el-test': testVoices(); break;
+    case 'el-custom': { const v = (($('#el-custom') || {}).value || '').trim(); if (!/^[A-Za-z0-9]{10,40}$/.test(v)) { toast('Pega un Voice ID válido de ElevenLabs.'); break; } EL[d.role] = v; saveEL(); toast('Voz actualizada'); render(); break; }
     case 'reset': UI.confirmReset = true; render(); break;
     case 'reset-no': UI.confirmReset = false; render(); break;
     case 'reset-yes': { const keep = S.progress.settings; S = blank(); S.progress.settings = keep; UI.confirmReset = false; touch(...SECTIONS); toast('Progreso borrado'); go('home'); break; }
@@ -1405,6 +2059,12 @@ document.addEventListener('input', e => {
   } else if (t.id === 'chatin') AI.chat.draft = t.value;
   else if (t.id === 'gentopic') AI.gen.topic = t.value;
   else if (t.id === 'importbox') UI.importText = t.value;
+  else if (t.id === 'ds-desc') DESIGN.desc = t.value;
+  else if (t.id === 'ds-text') DESIGN.text = t.value;
+});
+document.addEventListener('change', e => {
+  const t = e.target;
+  if (t.id === 'el-teacher' || t.id === 'el-native') { EL[t.id === 'el-teacher' ? 'teacher' : 'native'] = t.value; saveEL(); render(); }
 });
 document.addEventListener('keydown', e => {
   const tag = (e.target.tagName || '').toLowerCase();
@@ -1436,4 +2096,5 @@ render();
 if (ttsOK) { try { speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {}; } catch (e) {} }
 initCloud();
 initAI();
+elRefreshSub();
 })();

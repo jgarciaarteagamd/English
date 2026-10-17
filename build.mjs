@@ -1,4 +1,4 @@
-// Empaqueta src/ en un único index.html autocontenido (sin dependencias).
+// Empaqueta src/ en un único index.html autocontenido. Solo el montador de audio MP3 (vendor/lame.min.js) va aparte y se carga al generar audios.
 // Uso: node build.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -10,7 +10,8 @@ const content = [
   'src/content/grammar-c2.js',
   'src/content/vocab-1.js',
   'src/content/vocab-2.js',
-  'src/content/guide.js'
+  'src/content/guide.js',
+  'src/content/audio-b1.js'
 ].map(read).join('\n');
 const app = read('src/app.js');
 const css = read('src/styles.css');
@@ -34,3 +35,5 @@ const byLevel = l => G.filter(x => x.level === l).length;
 console.log(`index.html: ${(html.length / 1024).toFixed(0)} KB`);
 console.log(`Lecciones: ${G.length} (B1 ${byLevel('B1')}, B2 ${byLevel('B2')}, C1 ${byLevel('C1')}, C2 ${byLevel('C2')}) · ejercicios: ${G.reduce((a, l) => a + l.ex.length, 0)}`);
 console.log(`Vocabulario: ${V.length} mazos · ${V.reduce((a, d) => a + d.words.length, 0)} palabras`);
+const A = window.AUDIO || {};
+console.log(`Clases en audio: guiones en ${Object.keys(A).length} lecciones (${Object.keys(A).join(', ')})`);
