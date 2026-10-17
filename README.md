@@ -40,9 +40,32 @@ Las pausas (cortas, normales o largas) y la música se ajustan en Ajustes. Para 
 
 El repositorio no contiene nada privado: la clave de ElevenLabs y el progreso viven solo en tu navegador. El Tutor IA solo funciona dentro de Claude. Para llevar el progreso de un sitio a otro, usa *Ajustes → Copiar mi progreso / Restaurar*.
 
+## Tu cuenta: sincronización con Firebase
+
+En GitHub Pages, **Ajustes → Tu cuenta → Entrar con Google** guarda todo en el proyecto de Firebase `route2c2`, para usar la app en cualquier navegador:
+
+| Qué | Dónde |
+|---|---|
+| Progreso, errores, tarjetas y lecciones propias | Firestore `users/{uid}/data/{sección}` |
+| Ajustes de audio, incluida la clave de ElevenLabs | Firestore `users/{uid}/data/settings` |
+| Audios MP3 | Storage `users/{uid}/audio/*.mp3`, con su ficha en Firestore `users/{uid}/audio/{id}` |
+
+- La primera vez que entras en un dispositivo, se adopta lo que haya en tu cuenta. Antes se guarda una copia local en `rutaC2.v1.antesDeSincronizar`. Si la cuenta está vacía, se sube lo de ese dispositivo.
+- Después gana lo más reciente. Al volver a la pestaña se trae lo hecho en otro dispositivo.
+- Los audios se suben al generarse. En otro dispositivo se escuchan desde la nube y, si el bucket tiene CORS (`firebase/cors.json`), también se guardan en ese dispositivo.
+- La configuración web de Firebase está en `src/app.js` (`FB_CONFIG`). No es secreta: lo que protege los datos son las reglas de `firebase/firestore.rules` y `firebase/storage.rules`, que solo dejan entrar a tu correo.
+- Dentro de Claude se sigue usando el almacén de Claude.
+
+Configuración en la consola de Firebase: activar Google en *Authentication → Método de acceso*, autorizar el dominio de GitHub Pages en *Authentication → Configuración → Dominios autorizados*, crear Firestore y Storage, y pegar las reglas (cambiando `TU_CORREO@gmail.com`). Para CORS, desde Cloud Shell:
+
+```
+gcloud storage buckets update gs://route2c2.firebasestorage.app --cors-file=cors.json
+```
+
 ## Dónde se guarda el progreso
 
 - Siempre en el navegador (`localStorage`).
+- En GitHub Pages, si entras con Google, también en tu Firebase (ver arriba).
 - Dentro de Claude, además, en tu cuenta (almacén privado por persona del artefacto), así que se sincroniza entre dispositivos.
 - En *Ajustes* puedes copiar y restaurar una copia de seguridad.
 
@@ -60,6 +83,7 @@ src/
 build.mjs                                 genera index.html
 index.html                                resultado empaquetado
 vendor/lame.min.js                        codificador MP3 (se carga solo al generar audios)
+firebase/                                 reglas de seguridad de Firestore y Storage, y CORS del bucket
 ```
 
 Para regenerar `index.html` después de editar algo en `src/`:

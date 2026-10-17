@@ -102,7 +102,7 @@ function hydrate(raw) {
 }
 let S = (() => { try { const r = localStorage.getItem(LS_KEY); if (r) return hydrate(JSON.parse(r)); } catch (e) {} return blank(); })();
 const dirty = new Set();
-let DB = null, UID = null, sync = 'local', writing = false, syncTimer = null;
+let DB = null, UID = null, sync = 'local', syncErr = '', writing = false, syncTimer = null;
 
 function saveLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {} }
 function touch(...secs) { for (const s of secs) { S[s].updatedAt = Date.now(); dirty.add(s); } prune(); saveLocal(); scheduleSync(); }
@@ -128,11 +128,36 @@ async function flushSync() {
       try { await DB.doc('data/users/' + UID + '/' + s).set(clone(S[s])); sync = 'cloud'; }
       catch (e) {
         const code = e && e.code;
-        if (code === 'unavailable' || code === 'resource_exhausted') dirty.add(s);
-        else { sync = 'error'; }
+        if (code === 'unavailable' || code === 'resource_exhausted' || code === 'resource-exhausted') dirty.add(s);
+        else { sync = 'error'; syncErr = DB.fb ? fbMsg(e) : ''; }
       }
     }
   } finally { writing = false; renderSync(); if (dirty.size && sync !== 'error') setTimeout(scheduleSync, 3000 + Math.random() * 2000); }
+}
+/* Conecta un almacén remoto (el de Claude o tu Firebase) y trae lo más reciente.
+   adopt: primera vez en este dispositivo con esa cuenta, así que manda lo que hay en la nube. */
+async function connectDB(db, uid, adopt) {
+  DB = db; UID = uid; sync = 'syncing'; syncErr = ''; renderSync();
+  await pullCloud(adopt);
+}
+async function pullCloud(adopt) {
+  if (!DB) return;
+  let err = null;
+  const snaps = await Promise.all(SECTIONS.map(s => DB.doc('data/users/' + UID + '/' + s).get().catch(e => { err = err || e; return null; })));
+  if (err && DB.fb) throw err;
+  let changed = false;
+  snaps.forEach((snap, i) => {
+    const s = SECTIONS[i];
+    if (snap && snap.exists) {
+      const remote = snap.data() || {};
+      if ((adopt && remote.updatedAt) || (remote.updatedAt || 0) > (S[s].updatedAt || 0)) { S[s] = hydrateSection(s, clone(remote)); dirty.delete(s); changed = true; }
+      else if ((S[s].updatedAt || 0) > (remote.updatedAt || 0)) dirty.add(s);
+    } else if (S[s].updatedAt) dirty.add(s);
+  });
+  sync = 'cloud'; syncErr = '';
+  if (changed) { saveLocal(); render(); }
+  renderSync();
+  if (dirty.size) scheduleSync();
 }
 async function initCloud() {
   if (!window.claude || typeof window.claude.use !== 'function') return;
@@ -141,24 +166,13 @@ async function initCloud() {
     if (!db || !user) return;
     const id = await user.id();
     if (!id) return;
-    DB = db; UID = id; sync = 'syncing'; renderSync();
-    const snaps = await Promise.all(SECTIONS.map(s => db.doc('data/users/' + id + '/' + s).get().catch(() => null)));
-    let changed = false;
-    snaps.forEach((snap, i) => {
-      const s = SECTIONS[i];
-      if (snap && snap.exists) {
-        const remote = snap.data() || {};
-        if ((remote.updatedAt || 0) > (S[s].updatedAt || 0)) { S[s] = hydrateSection(s, clone(remote)); changed = true; }
-        else if ((S[s].updatedAt || 0) > (remote.updatedAt || 0)) dirty.add(s);
-      } else if (S[s].updatedAt) dirty.add(s);
-    });
-    sync = 'cloud';
-    if (changed) { saveLocal(); render(); }
-    renderSync();
-    if (dirty.size) scheduleSync();
+    await connectDB(db, id, false);
   } catch (e) { DB = null; sync = 'local'; renderSync(); }
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && dirty.size) flushSync(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { if (dirty.size) flushSync(); }
+  else if (DB && DB.fb) { pullCloud(false).catch(() => {}); fbRefresh(); }   // al volver a la pestaña trae lo hecho en otro dispositivo
+});
 
 /* ---------- Actividad, XP, racha ---------- */
 function act(k = today()) {
@@ -425,7 +439,8 @@ const saveJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); }
 let EL = loadJSON(EL_KEY, {key:'', model:'eleven_flash_v2_5', teacher:'STFMZniNPVEtF1Ug6b81', native:'JBFqnCBsd6RMkjVDRZzb', mine:[], pause:1, music:true});
 let AMETA = loadJSON(AMETA_KEY, {});
 let APOS = loadJSON(APOS_KEY, {});
-const saveEL = () => saveJSON(EL_KEY, EL), saveAMeta = () => saveJSON(AMETA_KEY, AMETA);
+const saveAMeta = () => saveJSON(AMETA_KEY, AMETA);
+function saveEL() { EL.updatedAt = Date.now(); saveJSON(EL_KEY, EL); fbPushELSoon(); }
 let ELSUB = null, genBusy = null;
 const GEN = {};
 const DESIGN = {busy:false, err:'', previews:[], desc:DESIGN_DESC, text:DESIGN_TEXT};
@@ -757,6 +772,7 @@ async function generateAudio(lessonId, kind, sample) {
       IDB.del('seg', keys).catch(() => {});
     }
     saveAMeta(); delete GEN[gk];
+    if (!sample) uploadAudio(id);
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
     toast(sample ? 'Muestra lista' : 'Audio listo: ya puedes escucharlo o descargarlo');
     if (sample) playAudio(id);
@@ -859,12 +875,17 @@ function playerEl() {
   return p;
 }
 async function playAudio(id) {
-  let buf = null; try { buf = await IDB.get('audio', id); } catch (e) {}
-  if (!buf) { toast('No encuentro este audio en este navegador.'); return; }
+  let buf = await IDB.get('audio', id).catch(() => null), src = null;
+  if (buf) src = URL.createObjectURL(new Blob([buf], {type:'audio/mpeg'}));
+  else if (AMETA[id] && AMETA[id].cloud && fbIn()) {
+    try { src = await cloudURL(id); } catch (e) { toast(fbMsg(e)); return; }
+    cacheFromCloud(id, src).then(render, () => {});   // se reproduce desde la nube y, en paralelo, se guarda en este dispositivo
+  }
+  if (!src) { toast(AMETA[id] && AMETA[id].cloud ? 'Entra con tu cuenta para escuchar este audio.' : 'No encuentro este audio en este navegador.'); return; }
   const p = playerEl(), a = $('#pl-audio'), [title, sub] = audioTitle(id);
-  if (PL.url) URL.revokeObjectURL(PL.url);
-  PL.url = URL.createObjectURL(new Blob([buf], {type:'audio/mpeg'})); PL.id = id;
-  a.src = PL.url; $('#pl-title').textContent = title; $('#pl-sub').textContent = sub;
+  if (PL.url && PL.url.startsWith('blob:')) URL.revokeObjectURL(PL.url);
+  PL.url = src; PL.id = id;
+  a.src = src; $('#pl-title').textContent = title; $('#pl-sub').textContent = sub;
   p.hidden = false; document.body.classList.add('has-player');
   if ('mediaSession' in navigator && window.MediaMetadata) try { navigator.mediaSession.metadata = new MediaMetadata({title, artist:'Ruta al C2', album:sub}); } catch (e) {}
   try { await a.play(); } catch (e) {}
@@ -875,24 +896,34 @@ function audioFileName(id) {
   const n = l && !l.ai ? `${l.level}-${pad(lessonNo(l))} ` : '';
   return `Ruta C2 ${n}${l ? l.title : lid} - ${AKINDS[kind].file}${smp ? ' (muestra)' : ''}.mp3`.replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, ' ');
 }
-async function audioFile(id) { const buf = await IDB.get('audio', id).catch(() => null); return buf ? new File([buf], audioFileName(id), {type:'audio/mpeg'}) : null; }
+async function audioBuf(id) {
+  const buf = await IDB.get('audio', id).catch(() => null);
+  if (buf || !(AMETA[id] && AMETA[id].cloud && fbIn())) return buf;
+  try { return await cacheFromCloud(id, await cloudURL(id)); } catch (e) { return null; }
+}
+async function audioFile(id) { const buf = await audioBuf(id); return buf ? new File([buf], audioFileName(id), {type:'audio/mpeg'}) : null; }
+function clickLink(href, name) { const a = document.createElement('a'); a.href = href; if (name) a.download = name; document.body.appendChild(a); a.click(); a.remove(); }
 async function downloadAudio(id) {
   const f = await audioFile(id);
-  if (!f) { toast('No encuentro este audio en este navegador.'); return; }
-  const url = URL.createObjectURL(f), a = document.createElement('a');
-  a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  if (f) { const url = URL.createObjectURL(f); clickLink(url, f.name); setTimeout(() => URL.revokeObjectURL(url), 60000); return; }
+  if (AMETA[id] && AMETA[id].cloud && fbIn()) { try { clickLink(await cloudURL(id)); return; } catch (e) { toast(fbMsg(e)); return; } }   // descarga directa desde la nube
+  toast('No encuentro este audio en este navegador.');
 }
 async function shareAudio(id) {
   const f = await audioFile(id);
-  if (!f) { toast('No encuentro este audio en este navegador.'); return; }
-  if (navigator.canShare && navigator.canShare({files:[f]})) { try { await navigator.share({files:[f], title:f.name}); } catch (e) {} }
+  if (f && navigator.canShare && navigator.canShare({files:[f]})) { try { await navigator.share({files:[f], title:f.name}); } catch (e) {} }
   else downloadAudio(id);
 }
 async function deleteAudio(id) {
+  const m = AMETA[id];
+  if (m && m.cloud) {
+    if (!fbIn()) { toast('Entra con tu cuenta para borrarlo también de tu nube.'); return false; }
+    try { await cloudDelete(id); } catch (e) { toast(fbMsg(e)); return false; }
+  }
   await IDB.del('audio', id).catch(() => {});
   delete AMETA[id]; delete APOS[id]; saveAMeta(); saveJSON(APOS_KEY, APOS);
   if (PL.id === id) closePlayer();
+  return true;
 }
 function openElSettings() { go('settings'); setTimeout(() => { const s = $('#el-settings'); if (s) s.scrollIntoView({behavior:'smooth', block:'start'}); }, 60); }
 
@@ -906,8 +937,9 @@ function audioRow(l, kind) {
     info = `<div class="arow-prog" data-prog="${id}">${genProgressHTML(g)}</div>`;
     acts = `<button class="btn sm" data-act="aud-stop" data-id="${id}">Pausar</button><span class="small muted">Deja esta pestaña abierta mientras se genera.</span>`;
   } else if (meta) {
-    const stale = meta.v !== hash(script);
-    info = `<span class="small muted num">Listo · ${fmtDur(meta.secs)} min · ${fmtMB(meta.bytes)}${stale ? ' · <b>hay una versión nueva del guion</b>' : ''}</span>`;
+    const stale = meta.v !== hash(script), up = AUP[id];
+    const where = up != null ? ` · <span data-up="${id}">subiendo a tu nube… ${up} %</span>` : meta.cloud ? (meta.local === false ? '' : ' · guardado en tu nube') : fbIn() ? ' · solo en este dispositivo' : '';
+    info = `<span class="small muted num">${meta.local === false ? 'En tu nube' : 'Listo'} · ${fmtDur(meta.secs)} min · ${fmtMB(meta.bytes)}${where}${stale ? ' · <b>hay una versión nueva del guion</b>' : ''}</span>`;
     acts = `<button class="btn sm primary" data-act="aud-play" data-id="${id}">${ic('play')}Escuchar</button><button class="btn sm" data-act="aud-dl" data-id="${id}">${ic('download')}Descargar MP3</button>${canShareFiles ? `<button class="btn sm ghost" data-act="aud-share" data-id="${id}">${ic('share')}Compartir</button>` : ''}`;
   } else {
     const full = planAudio(script), st = planStats(full), ss = planStats(samplePlan(full));
@@ -917,14 +949,14 @@ function audioRow(l, kind) {
   }
   const err = g && g.phase === 'error' ? `<div class="arow-err"><p class="small">${esc(g.err)}</p><div class="row"><button class="btn sm" data-act="${g.sample ? 'aud-sample' : 'aud-gen'}" data-id="${id}" ${busy ? 'disabled' : ''}>Continuar</button>${/Ajustes/.test(g.err) ? `<button class="btn sm ghost" data-act="el-setup">Ir a Ajustes</button>` : ''}</div></div>` : '';
   const cf = UI.audConfirm && UI.audConfirm.id === id ? UI.audConfirm.what : '';
-  const confirm = cf ? `<div class="confirm"><b>${cf === 'del' ? 'Se borrará de este navegador. Si ya lo descargaste, conservas tu archivo.' : `Regenerarlo vuelve a gastar ≈ ${fmtN(planStats(planAudio(script)).credits)} créditos.`}</b><div class="row"><button class="btn sm danger" data-act="aud-yes" data-id="${id}">${cf === 'del' ? 'Sí, borrar' : 'Sí, regenerar'}</button><button class="btn sm" data-act="aud-no">Cancelar</button></div></div>` : '';
+  const confirm = cf ? `<div class="confirm"><b>${cf === 'del' ? (meta && meta.cloud ? 'Se borrará de este navegador y de tu nube. Si ya lo descargaste, conservas tu archivo.' : 'Se borrará de este navegador. Si ya lo descargaste, conservas tu archivo.') : `Regenerarlo vuelve a gastar ≈ ${fmtN(planStats(planAudio(script)).credits)} créditos.`}</b><div class="row"><button class="btn sm danger" data-act="aud-yes" data-id="${id}">${cf === 'del' ? 'Sí, borrar' : 'Sí, regenerar'}</button><button class="btn sm" data-act="aud-no">Cancelar</button></div></div>` : '';
   const open = UI.scriptOpen === id;
   return `<div class="arow"><span class="arow-i">${ic(K.icon)}</span><div class="arow-body"><div class="arow-t"><b>${K.label}</b>${info}</div><div class="row arow-acts">${acts}</div>${err}
-    <div class="row arow-more"><button class="link small" data-act="aud-script" data-id="${id}">${open ? 'Ocultar guion' : 'Ver guion'}</button>${meta && !g ? `<button class="link small" data-act="aud-ask" data-w="regen" data-id="${id}">Regenerar</button><button class="link small" data-act="aud-ask" data-w="del" data-id="${id}">Borrar</button>` : ''}</div>${confirm}${open ? scriptView(script) : ''}</div></div>`;
+    <div class="row arow-more"><button class="link small" data-act="aud-script" data-id="${id}">${open ? 'Ocultar guion' : 'Ver guion'}</button>${meta && !g && fbIn() && meta.cloud === false && meta.local !== false && AUP[id] == null ? `<button class="link small" data-act="aud-up" data-id="${id}">Subir a mi nube</button>` : ''}${meta && !g ? `<button class="link small" data-act="aud-ask" data-w="regen" data-id="${id}">Regenerar</button><button class="link small" data-act="aud-ask" data-w="del" data-id="${id}">Borrar</button>` : ''}</div>${confirm}${open ? scriptView(script) : ''}</div></div>`;
 }
 function audioPanel(l, kinds) {
   return `<section class="audio-panel">
-    <div class="row between"><div class="row ap-head"><span class="ap-ico">${ic('headphones')}</span><div><h3>Clase en audio</h3><p class="small muted">Para escuchar en el carro o en el gimnasio. Se genera una sola vez con ElevenLabs y queda guardada en este navegador.</p></div></div><span data-credits>${creditsChip()}</span></div>
+    <div class="row between"><div class="row ap-head"><span class="ap-ico">${ic('headphones')}</span><div><h3>Clase en audio</h3><p class="small muted">Para escuchar en el carro o en el gimnasio. Se genera una sola vez con ElevenLabs y queda guardada${fbIn() ? ' en tu nube, lista para cualquier dispositivo' : ' en este navegador'}.</p></div></div><span data-credits>${creditsChip()}</span></div>
     ${EL.key ? '' : `<div class="ap-setup"><span class="small">Para generar audios, añade tu clave de ElevenLabs.</span><button class="btn sm" data-act="el-setup">${ic('gear')}Configurar ElevenLabs</button></div>`}
     <div class="arows">${kinds.map(k => audioRow(l, k)).join('')}</div></section>`;
 }
@@ -952,7 +984,7 @@ function elSettings() {
     + (voiceList(role).some(v => v.id === EL[role]) ? '' : `<option value="${esc(EL[role])}" selected>Voz personalizada (${esc(EL[role])})</option>`);
   const seg = (act, cur, list) => `<span class="seg">${list.map(([v, t]) => `<button data-act="${act}" data-v="${v}" aria-pressed="${String(cur) === String(v)}">${t}</button>`).join('')}</span>`;
   return `<section class="panel stack" id="el-settings"><h3>Clases en audio (ElevenLabs)</h3>
-    <p class="small muted">Tu clave se guarda solo en este navegador: no se sube a ningún sitio ni entra en la copia de seguridad.</p>
+    <p class="small muted">${fbIn() ? 'Tu clave se guarda en este navegador y en tu cuenta (solo tú puedes leerla), así que basta con pegarla una vez.' : 'Tu clave se guarda solo en este navegador: no se sube a ningún sitio ni entra en la copia de seguridad.'}</p>
     <details class="acc-mini" ${EL.key ? '' : 'open'}><summary>Cómo conseguir tu clave (2 minutos)</summary><ol class="small">
       <li>Entra en <a href="https://elevenlabs.io/app/developers/api-keys" target="_blank" rel="noopener">elevenlabs.io → Developers → API Keys</a> y pulsa <b>Create API Key</b>.</li>
       <li>Ponle un nombre (por ejemplo «Ruta C2») y activa los permisos <b>Text to Speech</b>, <b>Voices</b> (lectura y escritura), <b>Voice Generation</b> y <b>User</b> (lectura, para ver tus créditos).</li>
@@ -977,6 +1009,182 @@ function elSettings() {
     <div class="stack" style="gap:6px"><b>Pausas para pensar y repetir</b>${seg('el-pause', EL.pause, [[0.75, 'Cortas'], [1, 'Normales'], [1.35, 'Largas']])}</div>
     <div class="stack" style="gap:6px"><b>Cortinillas musicales entre temas</b>${seg('el-music', EL.music ? 1 : 0, [[1, 'Sí'], [0, 'No']])}<span class="small muted">Las crea la propia app: no gastan créditos.</span></div>
   </section>`;
+}
+
+/* =========================================================
+   Tu cuenta: sincronización con Firebase (fuera de Claude)
+   Progreso → Firestore users/{uid}/data/{sección} · ajustes de audio → users/{uid}/data/settings
+   Audios → Storage users/{uid}/audio/*.mp3 con su ficha en Firestore users/{uid}/audio/{id}
+   ========================================================= */
+const FB_CONFIG = {apiKey:'AIzaSyBRbArdHCz4t7tKQzrze73MEFw9_xV9hTw', authDomain:'route2c2.firebaseapp.com', projectId:'route2c2', storageBucket:'route2c2.firebasestorage.app', messagingSenderId:'299862485993', appId:'1:299862485993:web:63ac884c1ed1d55a15b978'};
+const FB_SDK = 'https://www.gstatic.com/firebasejs/12.19.0/';
+const FB_LINK = 'rutaC2.fbLinked';
+const FB = {state:'idle', user:null, m:null, err:'', busy:false};   // idle | out | in
+const AUP = {};   // subidas en curso: id → %
+const inClaude = () => !!(window.claude && typeof window.claude.use === 'function');
+const fbIn = () => FB.state === 'in' && !!FB.user && !!FB.m;
+let fbP = null;
+function fbLoad() {
+  return fbP || (fbP = (async () => {
+    const [app, auth, fs, st] = await Promise.all(['app', 'auth', 'firestore-lite', 'storage'].map(n => import(FB_SDK + 'firebase-' + n + '.js')));
+    const a = app.initializeApp(FB_CONFIG);
+    const m = {auth, fs, st, au:auth.getAuth(a), db:fs.getFirestore(a), storage:st.getStorage(a)};
+    const emu = localStorage.getItem('rutaC2.fbEmu');   // solo para probar con los emuladores locales de Firebase
+    if (emu) { auth.connectAuthEmulator(m.au, `http://${emu}:9099`, {disableWarnings:true}); fs.connectFirestoreEmulator(m.db, emu, 8080); st.connectStorageEmulator(m.storage, emu, 9199); }
+    FB.m = m;
+    auth.onAuthStateChanged(m.au, u => { fbAuthChanged(u); });
+    return m;
+  })().catch(e => { fbP = null; throw e; }));
+}
+function fbMsg(e, fallback) {
+  const c = String((e && e.code) || '');
+  if (/popup-closed|cancelled-popup/.test(c)) return '';
+  if (/popup-blocked/.test(c)) return 'El navegador bloqueó la ventana de Google. Vuelve a pulsar «Entrar con Google».';
+  if (/unauthorized-domain/.test(c)) return `Falta autorizar este sitio en Firebase: Authentication → Configuración → Dominios autorizados → añade ${location.hostname}.`;
+  if (/operation-not-allowed/.test(c)) return 'Activa el acceso con Google en Firebase: Authentication → Método de acceso → Google.';
+  if (/permission-denied|unauthorized|unauthenticated/.test(c)) return 'Firebase no da permiso. Revisa que pegaste las reglas de seguridad (Firestore y Storage) con tu correo de Google.';
+  if (/network|unavailable|retry-limit/.test(c)) return 'No hay conexión con Firebase. Revisa tu internet e inténtalo de nuevo.';
+  if (/object-not-found/.test(c)) return 'Este audio ya no está en tu nube.';
+  return (fallback || 'Firebase dio un error') + (c ? ` (${c})` : '.');
+}
+async function initFirebase() {
+  if (inClaude()) return;   // dentro de Claude se usa su propio almacén
+  FB.state = 'out';
+  if (localStorage.getItem(FB_LINK)) { try { await fbLoad(); } catch (e) { FB.err = 'No se pudo cargar Firebase. Revisa tu conexión.'; renderSync(); } }
+  else setTimeout(() => fbLoad().catch(() => {}), 2500);   // precarga: así la ventana de Google abre al primer clic
+}
+async function fbSignIn() {
+  FB.err = ''; FB.busy = true; render();
+  try {
+    const m = await fbLoad(), p = new m.auth.GoogleAuthProvider();
+    p.setCustomParameters({prompt:'select_account'});
+    await m.auth.signInWithPopup(m.au, p);
+  } catch (e) { FB.err = fbMsg(e, 'No se pudo entrar'); }
+  FB.busy = false; render();
+}
+async function fbSignOut() {
+  if (!FB.m) return;
+  try { await FB.m.auth.signOut(FB.m.au); } catch (e) {}
+}
+async function fbAuthChanged(u) {
+  if (!u) {
+    const was = fbIn();
+    FB.user = null; FB.state = 'out';
+    if (DB && DB.fb) { DB = null; UID = null; sync = 'local'; syncErr = ''; }
+    if (was) { for (const [id, m] of Object.entries(AMETA)) if (m.local === false) delete AMETA[id]; saveAMeta(); }
+    render(); return;
+  }
+  if (FB.user && FB.user.uid === u.uid) return;
+  FB.user = u; FB.state = 'in'; FB.err = '';
+  let linked = null; try { linked = localStorage.getItem(FB_LINK); localStorage.setItem(FB_LINK, u.uid); } catch (e) {}
+  const first = linked !== u.uid;
+  if (first) try { localStorage.setItem(LS_KEY + '.antesDeSincronizar', JSON.stringify(S)); } catch (e) {}   // copia por si acaso
+  render();
+  try {
+    await connectDB(fbStore(u.uid), u.uid, first);
+    await fbSyncEL(first);
+    await fbSyncAudios();
+    if (first) toast('Sesión iniciada: todo sincronizado con tu cuenta');
+  } catch (e) { sync = 'error'; syncErr = fbMsg(e); }
+  render();
+}
+/* Almacén con la misma forma que el de Claude: doc(ruta).get() / .set(). Se guarda como JSON para no chocar con los límites de Firestore. */
+function fbStore(uid) {
+  const {fs, db} = FB.m, ref = p => fs.doc(db, 'users', uid, 'data', p.split('/').pop());
+  return {fb:true, doc:p => ({
+    get:async () => { const snap = await fs.getDoc(ref(p)), d = snap.exists() ? snap.data() : null; return {exists:!!d, data:() => d && d.json ? JSON.parse(d.json) : d}; },
+    set:v => fs.setDoc(ref(p), {updatedAt:v.updatedAt || Date.now(), json:JSON.stringify(v)})
+  })};
+}
+function fbRefresh() { if (fbIn()) Promise.all([fbSyncEL(false), fbSyncAudios()]).then(render, () => {}); }
+/* Ajustes de audio (modelo, voces, clave de ElevenLabs…) */
+const elDoc = () => FB.m.fs.doc(FB.m.db, 'users', FB.user.uid, 'data', 'settings');
+let elPushT = null;
+function fbPushELSoon() { if (!fbIn()) return; clearTimeout(elPushT); elPushT = setTimeout(() => { fbPushEL().catch(() => {}); }, 1200); }
+const fbPushEL = () => FB.m.fs.setDoc(elDoc(), {updatedAt:EL.updatedAt || Date.now(), json:JSON.stringify(EL)});
+async function fbSyncEL(first) {
+  const snap = await FB.m.fs.getDoc(elDoc()), d = snap.exists() ? snap.data() : null, remote = d && d.json ? JSON.parse(d.json) : null;
+  if (remote && (first || (remote.updatedAt || 0) > (EL.updatedAt || 0))) {
+    const key = EL.key;
+    Object.assign(EL, remote);
+    if (!EL.key && key) { EL.key = key; EL.updatedAt = Date.now(); }
+    saveJSON(EL_KEY, EL);
+    if (EL.updatedAt !== remote.updatedAt) await fbPushEL();
+    elRefreshSub();
+  } else if (!remote || (EL.updatedAt || 0) > (remote.updatedAt || 0)) {
+    if (!EL.updatedAt) EL.updatedAt = Date.now();
+    saveJSON(EL_KEY, EL); await fbPushEL();
+  }
+}
+/* Audios en la nube */
+const audioRef = id => FB.m.st.ref(FB.m.storage, `users/${FB.user.uid}/audio/${id.replace('|', '__')}.mp3`);
+const audioDoc = id => FB.m.fs.doc(FB.m.db, 'users', FB.user.uid, 'audio', id);
+const cloudURL = id => FB.m.st.getDownloadURL(audioRef(id));
+async function cacheFromCloud(id, url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('http ' + r.status);
+  const buf = await r.arrayBuffer();
+  await IDB.put('audio', id, buf);
+  if (AMETA[id]) { AMETA[id].local = true; saveAMeta(); }
+  return buf;
+}
+async function cloudDelete(id) {
+  await FB.m.st.deleteObject(audioRef(id)).catch(e => { if (!/object-not-found/.test(e && e.code)) throw e; });
+  await FB.m.fs.deleteDoc(audioDoc(id));
+}
+function contentDisposition(name) {
+  const ascii = name.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\x20-\x7e]|"/g, '');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+async function uploadAudio(id) {
+  if (!fbIn() || AUP[id] != null) return;
+  const meta = AMETA[id], buf = await IDB.get('audio', id).catch(() => null);
+  if (!meta || !buf) return;
+  AUP[id] = 0; render();
+  try {
+    await new Promise((res, rej) => {
+      const task = FB.m.st.uploadBytesResumable(audioRef(id), new Uint8Array(buf), {contentType:'audio/mpeg', contentDisposition:contentDisposition(audioFileName(id))});
+      task.on('state_changed', s => {
+        AUP[id] = Math.round(s.bytesTransferred / (s.totalBytes || 1) * 100);
+        document.querySelectorAll(`[data-up="${id}"]`).forEach(el => { el.textContent = `subiendo a tu nube… ${AUP[id]} %`; });
+      }, rej, res);
+    });
+    await FB.m.fs.setDoc(audioDoc(id), {secs:meta.secs, bytes:meta.bytes, at:meta.at, model:meta.model || '', v:meta.v || ''});
+    meta.cloud = true;
+  } catch (e) { meta.cloud = false; toast(fbMsg(e, 'No se pudo subir el audio a tu nube')); }
+  saveAMeta(); delete AUP[id]; render();
+}
+async function fbSyncAudios() {
+  const {fs, db} = FB.m, remote = {}, up = [];
+  (await fs.getDocs(fs.collection(db, 'users', FB.user.uid, 'audio'))).forEach(d => { remote[d.id] = d.data(); });
+  for (const [id, r] of Object.entries(remote)) {
+    const l = AMETA[id];
+    if (!l || (r.at || 0) > (l.at || 0)) {   // nuevo o regenerado en otro dispositivo
+      if (l && l.local !== false) IDB.del('audio', id).catch(() => {});
+      AMETA[id] = Object.assign({}, r, {cloud:true, local:false});
+    } else if ((l.at || 0) > (r.at || 0)) up.push(id);
+    else l.cloud = true;
+  }
+  for (const [id, l] of Object.entries(AMETA)) {
+    if (id.split('|').length !== 2 || remote[id]) continue;
+    if (l.cloud) { if (l.local === false) delete AMETA[id]; else l.cloud = false; }   // borrado desde otro dispositivo
+    else if (l.cloud === undefined && l.local !== false) up.push(id);                // generado antes de entrar con tu cuenta
+  }
+  saveAMeta();
+  for (const id of up) await uploadAudio(id);
+}
+function acctSettings() {
+  if (inClaude()) return '';
+  const u = FB.user;
+  if (fbIn()) return `<section class="panel stack" id="acct"><h3>Tu cuenta</h3>
+    <div class="row acct">${u.photoURL ? `<img src="${esc(u.photoURL)}" alt="" referrerpolicy="no-referrer">` : `<span class="acct-i">${esc((u.displayName || u.email || '?').charAt(0).toUpperCase())}</span>`}<div class="stack" style="gap:2px"><b>${esc(u.displayName || 'Tu cuenta de Google')}</b><span class="small muted">${esc(u.email || '')}</span></div></div>
+    <p class="small muted">Tu progreso, tus ajustes de audio (incluida la clave de ElevenLabs) y tus audios se guardan en tu Firebase y se sincronizan en todos los dispositivos donde entres.</p>
+    ${sync === 'error' ? `<p class="small" style="color:var(--bad)">${esc(syncErr || 'No se pudo sincronizar.')}</p>` : ''}
+    <div class="row"><button class="btn" data-act="fb-sync">${ic('repeat')}Sincronizar ahora</button><button class="btn ghost" data-act="fb-out">Cerrar sesión</button></div></section>`;
+  return `<section class="panel stack" id="acct"><h3>Tu cuenta</h3>
+    <p class="small muted">Entra con Google para usar la app en cualquier navegador o teléfono: tu progreso, tus ajustes y tus audios se guardan en tu Firebase.</p>
+    <div class="row"><button class="btn primary" data-act="fb-in" ${FB.busy ? 'disabled' : ''}>${FB.busy ? 'Abriendo Google…' : 'Entrar con Google'}</button></div>
+    ${FB.err ? `<p class="small" style="color:var(--bad)">${esc(FB.err)}</p>` : ''}</section>`;
 }
 
 /* =========================================================
@@ -1075,7 +1283,7 @@ function renderNav() {
   if (side) side.innerHTML = `
     <div class="brand"><div class="brand-mark"><span>C2</span></div><div><b>Ruta al C2</b><small>Tu plataforma de inglés</small></div></div>
     <nav class="nav" aria-label="Secciones">${NAV.map(n => `<button data-act="nav" data-to="${n.id}" ${cur === n.id ? 'aria-current="page"' : ''}>${ic(n.icon)}<span>${n.label}</span>${navBadge(n.id)}</button>`).join('')}</nav>
-    <div class="side-foot"><div class="sync" id="sync"></div></div>`;
+    <div class="side-foot"><div class="sync" id="sync"></div><div id="acct-mini"></div></div>`;
   const tb = $('#tabbar');
   const tabs = [NAV[0], NAV[1], NAV[2], NAV[4], {id:'more', label:'Más', icon:'more'}];
   const moreIds = ['mistakes', 'audio', 'tutor', 'guide', 'settings', 'more'];
@@ -1091,6 +1299,8 @@ function renderSync() {
   const txt = sync === 'cloud' ? 'Progreso guardado en tu cuenta' : sync === 'syncing' ? 'Sincronizando…' : sync === 'error' ? 'No se pudo guardar en tu cuenta; se guarda en este navegador' : 'Progreso guardado en este navegador';
   el.className = 'sync' + (sync === 'cloud' ? ' on' : '');
   el.innerHTML = `<i></i><span>${txt}</span>`;
+  const am = $('#acct-mini');
+  if (am) am.innerHTML = fbIn() ? `<span class="small muted">Conectado: ${esc(FB.user.email || '')}</span>` : !inClaude() && FB.state === 'out' ? `<button class="link small" data-act="fb-in">Entrar con Google para sincronizar</button>` : '';
 }
 
 /* =========================================================
@@ -1880,6 +2090,7 @@ function viewSettings() {
   const st = S.progress.settings;
   const segBtns = (act, key, opts) => `<span class="seg">${opts.map(([v, t]) => `<button data-act="${act}" data-v="${v}" aria-pressed="${String(st[key]) === String(v)}">${t}</button>`).join('')}</span>`;
   return `${pageHead('Ajustes', 'Personaliza tu ritmo de estudio y gestiona tu progreso.')}
+  ${acctSettings()}
   <section class="panel stack"><h3>Ritmo</h3>
     <div class="stack" style="gap:6px"><b>Objetivo diario de XP</b>${segBtns('set-goal', 'goal', [[30, 'Ligero · 30'], [50, 'Normal · 50'], [80, 'Intenso · 80'], [120, 'Muy intenso · 120']])}<span class="small muted">Un ejercicio acertado da 10 XP; una tarjeta, 2 XP.</span></div>
     <div class="stack" style="gap:6px"><b>Palabras nuevas al día</b>${segBtns('set-new', 'newPerDay', [[5, '5'], [10, '10'], [15, '15'], [20, '20']])}</div>
@@ -1907,8 +2118,8 @@ function viewAudio() {
   return `${pageHead('Clases en audio', 'Teoría, refuerzo con frases nativas y vocabulario de cada lección, para escuchar mientras conduces o entrenas.')}
   <section class="panel stack"><div class="row between"><h3>Tu cuenta de ElevenLabs</h3><span data-credits>${creditsChip()}</span></div>
     ${EL.key ? `<p class="small muted">Modelo <b>${esc(elModel().name)}</b> · profesor: <b>${esc(voiceName('teacher', EL.teacher))}</b> · nativo: <b>${esc(voiceName('native', EL.native))}</b></p>` : '<p class="small">Aún no has añadido tu clave de ElevenLabs.</p>'}
-    <p class="small muted">${plural(made, 'audio generado', 'audios generados')} · guiones listos en ${ls.length} de ${GRAMMAR.length} lecciones. Los audios se guardan en este navegador; descárgalos para tenerlos siempre en el teléfono.</p>
-    <div class="row"><button class="btn sm" data-act="el-setup">${ic('gear')}Ajustes de audio</button></div></section>
+    <p class="small muted">${plural(made, 'audio generado', 'audios generados')} · guiones listos en ${ls.length} de ${GRAMMAR.length} lecciones. ${fbIn() ? 'Los audios se guardan en tu nube: puedes escucharlos desde cualquier dispositivo donde entres con tu cuenta.' : 'Los audios se guardan en este navegador; descárgalos o entra con tu cuenta de Google para tenerlos en todos tus dispositivos.'}</p>
+    <div class="row"><button class="btn sm" data-act="el-setup">${ic('gear')}Ajustes de audio</button>${!fbIn() && !inClaude() ? '<button class="btn sm" data-act="fb-in">Entrar con Google</button>' : ''}</div></section>
   ${ls.map(l => `<section class="panel stack"><div class="row between"><div class="row" style="gap:8px">${lvChip(l.level)}<b>${esc(l.title)}</b></div><button class="btn sm ghost" data-act="open-lesson" data-id="${esc(l.id)}">Abrir lección${ic('right')}</button></div><div class="arows">${Object.keys(AKINDS).map(k => audioRow(l, k)).join('')}</div></section>`).join('')}
   ${ls.length < GRAMMAR.length ? '<div class="empty">Las demás lecciones tendrán sus guiones más adelante. Cuando quieras más, pídele a Claude: «escribe los guiones de audio de las lecciones …».</div>' : ''}`;
 }
@@ -2022,10 +2233,14 @@ document.addEventListener('click', e => {
     case 'aud-yes': {
       const c = UI.audConfirm; UI.audConfirm = null;
       if (!c) break;
-      deleteAudio(c.id).then(() => { if (c.what === 'regen') { const [lid, kind] = c.id.split('|'); generateAudio(lid, kind); } else { toast('Audio borrado'); render(); } });
+      deleteAudio(c.id).then(ok => { if (!ok) { render(); return; } if (c.what === 'regen') { const [lid, kind] = c.id.split('|'); generateAudio(lid, kind); } else { toast('Audio borrado'); render(); } });
       break;
     }
     case 'pl-close': closePlayer(); break;
+    case 'aud-up': uploadAudio(d.id); break;
+    case 'fb-in': fbSignIn(); break;
+    case 'fb-out': fbSignOut(); break;
+    case 'fb-sync': if (DB && DB.fb) { sync = 'syncing'; renderSync(); flushSync().then(() => pullCloud(false)).then(fbRefresh).then(() => toast('Sincronizado'), e => { sync = 'error'; syncErr = fbMsg(e); render(); }); } break;
     case 'el-setup': openElSettings(); break;
     case 'el-save': { const v = (($('#el-key') || {}).value || '').trim(); EL.key = v; saveEL(); UI.elMsg = v ? 'Comprobando…' : ''; render(); if (v) elRefreshSub(true); break; }
     case 'el-forget': EL.key = ''; ELSUB = null; UI.elMsg = 'Clave eliminada de este navegador.'; saveEL(); render(); break;
@@ -2095,6 +2310,7 @@ document.addEventListener('keydown', e => {
 render();
 if (ttsOK) { try { speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {}; } catch (e) {} }
 initCloud();
+initFirebase();
 initAI();
 elRefreshSub();
 })();

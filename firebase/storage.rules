@@ -1,0 +1,16 @@
+rules_version = '2';
+// Solo tu cuenta de Google puede subir, escuchar o borrar tus audios. Cambia TU_CORREO@gmail.com por tu correo.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/{allPaths=**} {
+      allow read, delete: if request.auth != null
+        && request.auth.uid == uid
+        && request.auth.token.email == "TU_CORREO@gmail.com";
+      allow create, update: if request.auth != null
+        && request.auth.uid == uid
+        && request.auth.token.email == "TU_CORREO@gmail.com"
+        && request.resource.size < 60 * 1024 * 1024
+        && request.resource.contentType == "audio/mpeg";
+    }
+  }
+}

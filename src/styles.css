@@ -427,3 +427,7 @@ input[type=password]{width:100%;padding:11px 13px;border:1px solid var(--line);b
 body.has-player .main{padding-bottom:190px}
 body.has-player .toast{bottom:150px}
 @media (max-width:860px){.player{bottom:calc(72px + env(safe-area-inset-bottom,0px))}body.has-player .main{padding-bottom:250px}body.has-player .toast{bottom:calc(200px + env(safe-area-inset-bottom,0px))}}
+.acct{gap:12px;flex-wrap:nowrap}
+.acct img,.acct-i{width:44px;height:44px;border-radius:50%;flex:none;object-fit:cover}
+.acct-i{display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);font-weight:800}
+#acct-mini{padding-left:16px}
